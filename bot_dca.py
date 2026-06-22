@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.7.0 (22.06.2026)
+Версия 5.7.1 (22.06.2026)
 ИСПРАВЛЕНИЯ:
-- Исправлен метод get_balance (SPOT + UNIFIED + SUB-ACCOUNT)
-- Добавлена поддержка суб-аккаунтов Bybit
-- Исправлено получение цены для TONUSDT
+- Исправлен метод get_balance (SPOT + UNIFIED)
+- Исправлена ошибка shutdown
+- Добавлена обработка ошибок баланса
+- Удалена кнопка суб-аккаунта (не требуется)
 - Универсальная работа с SPOT торговлей
 """
 
@@ -70,7 +71,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.7.0 (22.06.2026)"
+BOT_VERSION = "5.7.1 (22.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -120,8 +121,7 @@ def get_moscow_time_naive() -> datetime:
     WAITING_PURCHASE_NOTIFY_TIME,
     AUTO_DCA_SETTINGS,
     SET_MANUAL_AMOUNT,
-    WAITING_SUB_ACCOUNT_UID,
-) = range(37)
+) = range(36)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
@@ -402,7 +402,6 @@ class Database:
                 ('first_order_date', ''),
                 ('next_dca_purchase_time', ''),
                 ('trading_mode', 'real'),
-                ('sub_account_uid', ''),
             ]
             
             for key, value in defaults:
@@ -448,14 +447,6 @@ class Database:
     
     def is_demo_mode(self) -> bool:
         return self.get_trading_mode() == 'demo'
-    
-    def get_sub_account_uid(self) -> str:
-        """Получение UID суб-аккаунта"""
-        return self.get_setting('sub_account_uid', '')
-    
-    def set_sub_account_uid(self, uid: str):
-        """Установка UID суб-аккаунта"""
-        self.set_setting('sub_account_uid', uid)
     
     def get_first_order_date(self) -> Optional[datetime]:
         date_str = self.get_setting('first_order_date', '')
@@ -1636,7 +1627,6 @@ class BybitClient:
         self._price_cache = {}
         self._cache_time = {}
         self._cache_ttl = 5
-        self.db = Database()
         self._init_session()
     
     def _init_session(self):
@@ -1788,42 +1778,6 @@ class BybitClient:
                             }
             except Exception as e:
                 logger.warning(f"Error getting balance with UNIFIED: {e}")
-            
-            # 3. Если ничего не сработало, пробуем с суб-аккаунтом
-            try:
-                sub_uid = self.db.get_sub_account_uid()
-                if sub_uid:
-                    response = self.session.get_wallet_balance(
-                        accountType="SPOT",
-                        subAccountUid=sub_uid
-                    )
-                    if response['retCode'] == 0:
-                        result_list = response['result']['list']
-                        if result_list:
-                            account_data = result_list[0]
-                            coins = account_data.get('coin', [])
-                            
-                            if coin:
-                                for c in coins:
-                                    if c.get('coin') == coin:
-                                        wallet_balance = float(c.get('walletBalance', 0) or 0)
-                                        equity = float(c.get('equity', 0) or 0) or wallet_balance
-                                        locked = float(c.get('locked', 0) or 0)
-                                        available = wallet_balance - locked
-                                        usd_value = float(c.get('usdValue', 0) or 0)
-                                        
-                                        logger.info(f"Balance for {coin} (SUB_ACCOUNT): available={available:.2f}")
-                                        return {
-                                            'coin': coin, 
-                                            'equity': equity, 
-                                            'available': available, 
-                                            'usdValue': usd_value,
-                                            'account_type': 'SUB_ACCOUNT'
-                                        }
-                                
-                                return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
-            except Exception as e:
-                logger.warning(f"Error getting balance with subAccountUid: {e}")
             
             return {'error': 'Не удалось получить баланс'}
             
@@ -3817,8 +3771,6 @@ class FastDCABot:
         mode = self.db.get_trading_mode()
         mode_button = "🌐 Режим: Демо" if mode == 'demo' else "🌐 Режим: Обычный"
         manual_amount = self.db.get_manual_amount()
-        sub_uid = self.db.get_sub_account_uid()
-        sub_button = f"🆔 Суб-аккаунт: {sub_uid if sub_uid else 'не задан'}"
         
         keyboard = [
             [KeyboardButton("🪙 Выбор токена"), KeyboardButton("🚀 Настройки Авто DCA")],
@@ -3826,7 +3778,6 @@ class FastDCABot:
             [KeyboardButton("💵 Сумма для ручного ордера"), KeyboardButton("⚙️ Настройки отслеживания")],
             [KeyboardButton("🔔 Уведомления о покупке"), KeyboardButton(mode_button)],
             [KeyboardButton("📤 Экспорт базы"), KeyboardButton("📥 Импорт базы")],
-            [KeyboardButton(sub_button)],
             [KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -4184,65 +4135,6 @@ class FastDCABot:
         except ValueError as e:
             await update.message.reply_text(f"❌ {str(e)}", reply_markup=self.get_cancel_keyboard())
             return SET_MANUAL_AMOUNT
-    
-    async def set_sub_account_uid_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Начало настройки UID суб-аккаунта"""
-        if not await self._check_user_fast(update):
-            return SELECTING_ACTION
-        
-        current_uid = self.db.get_sub_account_uid()
-        await update.message.reply_text(
-            f"🆔 *Настройка UID суб-аккаунта*\n\n"
-            f"Текущий UID: `{current_uid or 'не задан'}`\n\n"
-            f"UID можно найти:\n"
-            f"1. В приложении Bybit → Аккаунт → Суб-аккаунты\n"
-            f"2. Или на сайте: Аккаунт → Управление суб-аккаунтами\n\n"
-            f"Если вы используете основной аккаунт — оставьте поле пустым.\n"
-            f"Введите UID или нажмите '❌ Отмена':",
-            reply_markup=self.get_cancel_keyboard(),
-            parse_mode='Markdown'
-        )
-        return WAITING_SUB_ACCOUNT_UID
-    
-    async def set_sub_account_uid_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Сохранение UID суб-аккаунта"""
-        text = update.message.text.strip()
-        
-        if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        
-        # Если пусто - удаляем настройку
-        if text == "" or text == "оставить пустым":
-            self.db.set_sub_account_uid("")
-            await update.message.reply_text(
-                "✅ Настройка суб-аккаунта удалена. Используется основной аккаунт.",
-                reply_markup=self.get_settings_keyboard()
-            )
-            return SELECTING_ACTION
-        
-        # Проверяем, что это число
-        try:
-            uid = int(text.strip())
-            self.db.set_sub_account_uid(str(uid))
-            
-            # Переинициализируем Bybit для применения изменений
-            self.bybit_initialized = False
-            self._init_bybit()
-            
-            await update.message.reply_text(
-                f"✅ UID суб-аккаунта установлен: `{uid}`\n\n"
-                f"Клиент Bybit переподключен с настройками суб-аккаунта.",
-                reply_markup=self.get_settings_keyboard(),
-                parse_mode='Markdown'
-            )
-            return SELECTING_ACTION
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Некорректный UID. Введите число или оставьте пустым для основного аккаунта.",
-                reply_markup=self.get_cancel_keyboard()
-            )
-            return WAITING_SUB_ACCOUNT_UID
     
     async def handle_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -4824,12 +4716,8 @@ class FastDCABot:
         next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
         mode = self.db.get_trading_mode()
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
-        sub_uid = self.db.get_sub_account_uid()
-        sub_text = f"Суб-аккаунт: {sub_uid if sub_uid else 'основной'}"
-        
         message = f"📋 *Статус бота*\n\n"
         message += f"🌐 Режим: {mode_text}\n"
-        message += f"🆔 {sub_text}\n"
         message += f"🤖 Статус: {'✅ Активен' if is_active else '⏹ Остановлен'}\n"
         if is_active and next_purchase_str:
             try:
@@ -5135,7 +5023,6 @@ class FastDCABot:
         await update.message.reply_text("🔄 Статистика DCA очищена! Лестница сброшена.\n⚠️ ID покупок будут начинаться с 1 при следующем добавлении.", reply_markup=self.get_ladder_settings_keyboard())
         return LADDER_MENU
     
-    # Ручные покупки
     async def manual_buy_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -5260,7 +5147,6 @@ class FastDCABot:
             return MANUAL_BUY_AMOUNT
         return ConversationHandler.END
     
-    # Добавление покупки вручную
     async def manual_add_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -5379,7 +5265,6 @@ class FastDCABot:
             await update.message.reply_text(f"❌ Ошибка! Введите корректное количество.\nПример: 10.5 или 10,5\n\nОшибка: {str(e)}", reply_markup=self.get_cancel_keyboard())
             return MANUAL_ADD_AMOUNT
     
-    # Редактирование покупок
     async def edit_purchases_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -6089,21 +5974,6 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.handle_import_cancel))
         self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_import_file))
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
-        
-        # НОВЫЙ ОБРАБОТЧИК для суб-аккаунта
-        sub_account_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^🆔 Суб-аккаунт:'), self.set_sub_account_uid_start)],
-            states={
-                WAITING_SUB_ACCOUNT_UID: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_sub_account_uid_done)
-                ]
-            },
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="sub_account_conversation",
-            persistent=False,
-            conversation_timeout=CONVERSATION_TIMEOUT
-        )
-        self.application.add_handler(sub_account_conv)
         
         purchase_notify_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings)],
