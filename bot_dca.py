@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.6.2 (22.06.2026)
+Версия 5.7.0 (22.06.2026)
 ИСПРАВЛЕНИЯ:
-- Исправлен метод get_balance (SPOT + UNIFIED)
-- Исправлена ошибка shutdown
-- Добавлена обработка ошибок баланса
+- Исправлен метод get_balance (SPOT + UNIFIED + SUB-ACCOUNT)
+- Добавлена поддержка суб-аккаунтов Bybit
+- Исправлено получение цены для TONUSDT
+- Универсальная работа с SPOT торговлей
 """
 
 import os
@@ -69,7 +70,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.6.2 (22.06.2026)"
+BOT_VERSION = "5.7.0 (22.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -119,7 +120,8 @@ def get_moscow_time_naive() -> datetime:
     WAITING_PURCHASE_NOTIFY_TIME,
     AUTO_DCA_SETTINGS,
     SET_MANUAL_AMOUNT,
-) = range(36)
+    WAITING_SUB_ACCOUNT_UID,
+) = range(37)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
@@ -400,6 +402,7 @@ class Database:
                 ('first_order_date', ''),
                 ('next_dca_purchase_time', ''),
                 ('trading_mode', 'real'),
+                ('sub_account_uid', ''),
             ]
             
             for key, value in defaults:
@@ -445,6 +448,14 @@ class Database:
     
     def is_demo_mode(self) -> bool:
         return self.get_trading_mode() == 'demo'
+    
+    def get_sub_account_uid(self) -> str:
+        """Получение UID суб-аккаунта"""
+        return self.get_setting('sub_account_uid', '')
+    
+    def set_sub_account_uid(self, uid: str):
+        """Установка UID суб-аккаунта"""
+        self.set_setting('sub_account_uid', uid)
     
     def get_first_order_date(self) -> Optional[datetime]:
         date_str = self.get_setting('first_order_date', '')
@@ -1625,58 +1636,81 @@ class BybitClient:
         self._price_cache = {}
         self._cache_time = {}
         self._cache_ttl = 5
+        self.db = Database()
         self._init_session()
     
     def _init_session(self):
         try:
-            self.session = HTTP(testnet=self.testnet, api_key=self.api_key, api_secret=self.api_secret, recv_window=5000)
+            self.session = HTTP(
+                testnet=self.testnet, 
+                api_key=self.api_key, 
+                api_secret=self.api_secret, 
+                recv_window=5000
+            )
             logger.info(f"Bybit session initialized (testnet={self.testnet})")
         except Exception as e:
             logger.error(f"Session init error: {e}")
     
     async def get_symbol_price(self, symbol: str) -> Optional[float]:
+        """Получение цены с поддержкой разных форматов символов"""
         now = time.time()
         if symbol in self._cache_time and now - self._cache_time.get(symbol, 0) < self._cache_ttl:
             return self._price_cache.get(symbol)
+        
         try:
             if not self.session:
                 self._init_session()
-            response = self.session.get_tickers(category="spot", symbol=symbol)
-            if response['retCode'] == 0 and response['result']['list']:
-                price = float(response['result']['list'][0]['lastPrice'])
-                self._price_cache[symbol] = price
-                self._cache_time[symbol] = now
-                return price
+            
+            # Список символов для проверки
+            symbols_to_check = [symbol]
+            
+            # Для TON пробуем разные варианты
+            if "TON" in symbol:
+                symbols_to_check.extend(["TONUSDT", "TONCOINUSDT"])
+            
+            # Убираем дубликаты
+            symbols_to_check = list(set(symbols_to_check))
+            
+            for sym in symbols_to_check:
+                try:
+                    response = self.session.get_tickers(category="spot", symbol=sym)
+                    if response['retCode'] == 0 and response['result']['list']:
+                        price = float(response['result']['list'][0]['lastPrice'])
+                        self._price_cache[symbol] = price
+                        self._cache_time[symbol] = now
+                        logger.info(f"Price for {symbol}: {price} (from {sym})")
+                        return price
+                except Exception as e:
+                    logger.debug(f"Could not get price for {sym}: {e}")
+                    continue
+            
+            # Если не нашли, пробуем получить список всех тикеров
+            try:
+                response = self.session.get_tickers(category="spot")
+                if response['retCode'] == 0:
+                    for ticker in response['result']['list']:
+                        if ticker['symbol'] == symbol:
+                            price = float(ticker['lastPrice'])
+                            self._price_cache[symbol] = price
+                            self._cache_time[symbol] = now
+                            logger.info(f"Price for {symbol} from tickers list: {price}")
+                            return price
+            except Exception as e:
+                logger.warning(f"Could not get tickers list: {e}")
+            
+            logger.warning(f"Symbol {symbol} not found")
             return None
         except Exception as e:
             logger.error(f"Error getting price for {symbol}: {e}")
             return None
     
-    async def cancel_all_sell_orders(self, symbol: str) -> Tuple[int, List[str]]:
-        try:
-            open_orders = await self.get_open_orders(symbol)
-            sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
-            cancelled_ids = []
-            for order in sell_orders:
-                order_id = order.get('orderId')
-                result = await self.cancel_order(symbol, order_id)
-                if result['success']:
-                    cancelled_ids.append(order_id)
-                    logger.info(f"Cancelled sell order {order_id} for {symbol}")
-                else:
-                    logger.warning(f"Failed to cancel order {order_id}: {result.get('error')}")
-            return len(cancelled_ids), cancelled_ids
-        except Exception as e:
-            logger.error(f"Error cancelling sell orders: {e}")
-            return 0, []
-    
     async def get_balance(self, coin: str = None) -> Dict:
-        """Получение баланса с поддержкой разных типов аккаунтов"""
+        """Универсальное получение баланса для всех типов аккаунтов (SPOT)"""
         try:
             if not self.session:
                 self._init_session()
             
-            # Сначала пробуем SPOT (для обычных API ключей)
+            # 1. Пробуем SPOT (основной метод для спотовой торговли)
             try:
                 response = self.session.get_wallet_balance(accountType="SPOT")
                 if response['retCode'] == 0:
@@ -1693,17 +1727,30 @@ class BybitClient:
                                     locked = float(c.get('locked', 0) or 0)
                                     available = wallet_balance - locked
                                     usd_value = float(c.get('usdValue', 0) or 0)
-                                    logger.info(f"Balance for {coin}: available={available}, equity={equity}")
-                                    return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
+                                    
+                                    logger.info(f"Balance for {coin} (SPOT): available={available:.2f}, equity={equity:.2f}")
+                                    return {
+                                        'coin': coin, 
+                                        'equity': equity, 
+                                        'available': available, 
+                                        'usdValue': usd_value,
+                                        'account_type': 'SPOT'
+                                    }
                             
+                            # Если монета не найдена
                             logger.warning(f"Coin {coin} not found in SPOT response")
+                            return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
                         else:
                             total_equity = float(account_data.get('totalEquity', 0) or 0)
-                            return {'total_equity': total_equity, 'coins': coins}
+                            return {
+                                'total_equity': total_equity, 
+                                'coins': coins,
+                                'account_type': 'SPOT'
+                            }
             except Exception as e:
                 logger.warning(f"Error getting balance with SPOT: {e}")
             
-            # Если SPOT не сработал, пробуем UNIFIED
+            # 2. Если SPOT не сработал, пробуем UNIFIED
             try:
                 response = self.session.get_wallet_balance(accountType="UNIFIED")
                 if response['retCode'] == 0:
@@ -1720,15 +1767,63 @@ class BybitClient:
                                     locked = float(c.get('locked', 0) or 0)
                                     available = wallet_balance - locked
                                     usd_value = float(c.get('usdValue', 0) or 0)
-                                    logger.info(f"Balance for {coin} (UNIFIED): available={available}, equity={equity}")
-                                    return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
+                                    
+                                    logger.info(f"Balance for {coin} (UNIFIED): available={available:.2f}")
+                                    return {
+                                        'coin': coin, 
+                                        'equity': equity, 
+                                        'available': available, 
+                                        'usdValue': usd_value,
+                                        'account_type': 'UNIFIED'
+                                    }
                             
                             logger.warning(f"Coin {coin} not found in UNIFIED response")
+                            return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
                         else:
                             total_equity = float(account_data.get('totalEquity', 0) or 0)
-                            return {'total_equity': total_equity, 'coins': coins}
+                            return {
+                                'total_equity': total_equity, 
+                                'coins': coins,
+                                'account_type': 'UNIFIED'
+                            }
             except Exception as e:
                 logger.warning(f"Error getting balance with UNIFIED: {e}")
+            
+            # 3. Если ничего не сработало, пробуем с суб-аккаунтом
+            try:
+                sub_uid = self.db.get_sub_account_uid()
+                if sub_uid:
+                    response = self.session.get_wallet_balance(
+                        accountType="SPOT",
+                        subAccountUid=sub_uid
+                    )
+                    if response['retCode'] == 0:
+                        result_list = response['result']['list']
+                        if result_list:
+                            account_data = result_list[0]
+                            coins = account_data.get('coin', [])
+                            
+                            if coin:
+                                for c in coins:
+                                    if c.get('coin') == coin:
+                                        wallet_balance = float(c.get('walletBalance', 0) or 0)
+                                        equity = float(c.get('equity', 0) or 0) or wallet_balance
+                                        locked = float(c.get('locked', 0) or 0)
+                                        available = wallet_balance - locked
+                                        usd_value = float(c.get('usdValue', 0) or 0)
+                                        
+                                        logger.info(f"Balance for {coin} (SUB_ACCOUNT): available={available:.2f}")
+                                        return {
+                                            'coin': coin, 
+                                            'equity': equity, 
+                                            'available': available, 
+                                            'usdValue': usd_value,
+                                            'account_type': 'SUB_ACCOUNT'
+                                        }
+                                
+                                return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
+            except Exception as e:
+                logger.warning(f"Error getting balance with subAccountUid: {e}")
             
             return {'error': 'Не удалось получить баланс'}
             
@@ -1736,50 +1831,11 @@ class BybitClient:
             logger.error(f"Error getting balance: {e}")
             return {'error': str(e)}
     
-    async def get_open_orders(self, symbol: str = None) -> List[Dict]:
-        try:
-            if not self.session:
-                self._init_session()
-            params = {"category": "spot"}
-            if symbol:
-                params['symbol'] = symbol
-            response = self.session.get_open_orders(**params)
-            if response['retCode'] == 0:
-                return response['result']['list']
-            return []
-        except Exception as e:
-            logger.error(f"Error getting open orders: {e}")
-            return []
-    
-    async def get_open_orders_by_side(self, symbol: str = None) -> Dict[str, List[Dict]]:
-        orders = await self.get_open_orders(symbol)
-        buy_orders = [o for o in orders if o.get('side') == 'Buy']
-        sell_orders = [o for o in orders if o.get('side') == 'Sell']
-        return {'buy': buy_orders, 'sell': sell_orders}
-    
-    async def get_sell_orders(self, symbol: str = None) -> List[Dict]:
-        orders = await self.get_open_orders(symbol)
-        return [o for o in orders if o.get('side') == 'Sell']
-    
-    async def get_order_history(self, symbol: str = None, limit: int = 500) -> List[Dict]:
-        try:
-            if not self.session:
-                self._init_session()
-            params = {"category": "spot", "limit": limit}
-            if symbol:
-                params['symbol'] = symbol
-            response = self.session.get_order_history(**params)
-            if response['retCode'] == 0:
-                return response['result']['list']
-            return []
-        except Exception as e:
-            logger.error(f"Error getting order history: {e}")
-            return []
-    
     async def get_instrument_info(self, symbol: str) -> Dict:
         try:
             if not self.session:
                 self._init_session()
+            
             response = self.session.get_instruments_info(category="spot", symbol=symbol)
             if response['retCode'] == 0 and response['result']['list']:
                 info = response['result']['list'][0]
@@ -1823,7 +1879,6 @@ class BybitClient:
         return round(rounded, decimal_places)
     
     def _round_quantity_by_step(self, quantity: float, qty_step: float, min_qty: float) -> float:
-        """Округление количества с учетом шага и минимального количества"""
         if qty_step <= 0:
             return round(quantity, 4)
         
@@ -1839,6 +1894,46 @@ class BybitClient:
             rounded = min_qty
         
         return round(rounded, decimal_places)
+    
+    async def get_open_orders(self, symbol: str = None) -> List[Dict]:
+        try:
+            if not self.session:
+                self._init_session()
+            params = {"category": "spot"}
+            if symbol:
+                params['symbol'] = symbol
+            response = self.session.get_open_orders(**params)
+            if response['retCode'] == 0:
+                return response['result']['list']
+            return []
+        except Exception as e:
+            logger.error(f"Error getting open orders: {e}")
+            return []
+    
+    async def get_open_orders_by_side(self, symbol: str = None) -> Dict[str, List[Dict]]:
+        orders = await self.get_open_orders(symbol)
+        buy_orders = [o for o in orders if o.get('side') == 'Buy']
+        sell_orders = [o for o in orders if o.get('side') == 'Sell']
+        return {'buy': buy_orders, 'sell': sell_orders}
+    
+    async def get_sell_orders(self, symbol: str = None) -> List[Dict]:
+        orders = await self.get_open_orders(symbol)
+        return [o for o in orders if o.get('side') == 'Sell']
+    
+    async def get_order_history(self, symbol: str = None, limit: int = 500) -> List[Dict]:
+        try:
+            if not self.session:
+                self._init_session()
+            params = {"category": "spot", "limit": limit}
+            if symbol:
+                params['symbol'] = symbol
+            response = self.session.get_order_history(**params)
+            if response['retCode'] == 0:
+                return response['result']['list']
+            return []
+        except Exception as e:
+            logger.error(f"Error getting order history: {e}")
+            return []
     
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
         try:
@@ -1933,6 +2028,24 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
+    
+    async def cancel_all_sell_orders(self, symbol: str) -> Tuple[int, List[str]]:
+        try:
+            open_orders = await self.get_open_orders(symbol)
+            sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
+            cancelled_ids = []
+            for order in sell_orders:
+                order_id = order.get('orderId')
+                result = await self.cancel_order(symbol, order_id)
+                if result['success']:
+                    cancelled_ids.append(order_id)
+                    logger.info(f"Cancelled sell order {order_id} for {symbol}")
+                else:
+                    logger.warning(f"Failed to cancel order {order_id}: {result.get('error')}")
+            return len(cancelled_ids), cancelled_ids
+        except Exception as e:
+            logger.error(f"Error cancelling sell orders: {e}")
+            return 0, []
     
     async def amend_order_price(self, symbol: str, order_id: str, new_price: float) -> Dict:
         try:
@@ -3704,12 +3817,16 @@ class FastDCABot:
         mode = self.db.get_trading_mode()
         mode_button = "🌐 Режим: Демо" if mode == 'demo' else "🌐 Режим: Обычный"
         manual_amount = self.db.get_manual_amount()
+        sub_uid = self.db.get_sub_account_uid()
+        sub_button = f"🆔 Суб-аккаунт: {sub_uid if sub_uid else 'не задан'}"
+        
         keyboard = [
             [KeyboardButton("🪙 Выбор токена"), KeyboardButton("🚀 Настройки Авто DCA")],
             [KeyboardButton("📊 Процент прибыли"), KeyboardButton("🪜 Лестница Мартингейла")],
             [KeyboardButton("💵 Сумма для ручного ордера"), KeyboardButton("⚙️ Настройки отслеживания")],
             [KeyboardButton("🔔 Уведомления о покупке"), KeyboardButton(mode_button)],
             [KeyboardButton("📤 Экспорт базы"), KeyboardButton("📥 Импорт базы")],
+            [KeyboardButton(sub_button)],
             [KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -4067,6 +4184,65 @@ class FastDCABot:
         except ValueError as e:
             await update.message.reply_text(f"❌ {str(e)}", reply_markup=self.get_cancel_keyboard())
             return SET_MANUAL_AMOUNT
+    
+    async def set_sub_account_uid_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начало настройки UID суб-аккаунта"""
+        if not await self._check_user_fast(update):
+            return SELECTING_ACTION
+        
+        current_uid = self.db.get_sub_account_uid()
+        await update.message.reply_text(
+            f"🆔 *Настройка UID суб-аккаунта*\n\n"
+            f"Текущий UID: `{current_uid or 'не задан'}`\n\n"
+            f"UID можно найти:\n"
+            f"1. В приложении Bybit → Аккаунт → Суб-аккаунты\n"
+            f"2. Или на сайте: Аккаунт → Управление суб-аккаунтами\n\n"
+            f"Если вы используете основной аккаунт — оставьте поле пустым.\n"
+            f"Введите UID или нажмите '❌ Отмена':",
+            reply_markup=self.get_cancel_keyboard(),
+            parse_mode='Markdown'
+        )
+        return WAITING_SUB_ACCOUNT_UID
+    
+    async def set_sub_account_uid_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сохранение UID суб-аккаунта"""
+        text = update.message.text.strip()
+        
+        if text == "❌ Отмена":
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
+            return SELECTING_ACTION
+        
+        # Если пусто - удаляем настройку
+        if text == "" or text == "оставить пустым":
+            self.db.set_sub_account_uid("")
+            await update.message.reply_text(
+                "✅ Настройка суб-аккаунта удалена. Используется основной аккаунт.",
+                reply_markup=self.get_settings_keyboard()
+            )
+            return SELECTING_ACTION
+        
+        # Проверяем, что это число
+        try:
+            uid = int(text.strip())
+            self.db.set_sub_account_uid(str(uid))
+            
+            # Переинициализируем Bybit для применения изменений
+            self.bybit_initialized = False
+            self._init_bybit()
+            
+            await update.message.reply_text(
+                f"✅ UID суб-аккаунта установлен: `{uid}`\n\n"
+                f"Клиент Bybit переподключен с настройками суб-аккаунта.",
+                reply_markup=self.get_settings_keyboard(),
+                parse_mode='Markdown'
+            )
+            return SELECTING_ACTION
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Некорректный UID. Введите число или оставьте пустым для основного аккаунта.",
+                reply_markup=self.get_cancel_keyboard()
+            )
+            return WAITING_SUB_ACCOUNT_UID
     
     async def handle_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -4648,8 +4824,12 @@ class FastDCABot:
         next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
         mode = self.db.get_trading_mode()
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
+        sub_uid = self.db.get_sub_account_uid()
+        sub_text = f"Суб-аккаунт: {sub_uid if sub_uid else 'основной'}"
+        
         message = f"📋 *Статус бота*\n\n"
         message += f"🌐 Режим: {mode_text}\n"
+        message += f"🆔 {sub_text}\n"
         message += f"🤖 Статус: {'✅ Активен' if is_active else '⏹ Остановлен'}\n"
         if is_active and next_purchase_str:
             try:
@@ -5909,6 +6089,21 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.handle_import_cancel))
         self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_import_file))
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
+        
+        # НОВЫЙ ОБРАБОТЧИК для суб-аккаунта
+        sub_account_conv = ConversationHandler(
+            entry_points=[MessageHandler(filters.Regex('^🆔 Суб-аккаунт:'), self.set_sub_account_uid_start)],
+            states={
+                WAITING_SUB_ACCOUNT_UID: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_sub_account_uid_done)
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+            name="sub_account_conversation",
+            persistent=False,
+            conversation_timeout=CONVERSATION_TIMEOUT
+        )
+        self.application.add_handler(sub_account_conv)
         
         purchase_notify_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings)],
