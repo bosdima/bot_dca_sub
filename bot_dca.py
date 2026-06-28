@@ -8,6 +8,7 @@ DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 - Уведомления об истечении API ключа
 - Автоматическое восстановление при смене ключа
 - Команда /check_api для ручной проверки
+- Добавлен конфигурационный блок для токенов
 """
 
 import os
@@ -51,6 +52,11 @@ if sys.platform == 'win32':
 
 init(autoreset=True)
 load_dotenv()
+
+# ============ НАСТРОЙКИ ТОКЕНОВ ============
+DEFAULT_SYMBOL = "ETHUSDT"  # Токен по умолчанию
+POPULAR_SYMBOLS = ["ETHUSDT", "XRPUSDT", "BTCUSDT"]  # Список для кнопок
+# ===========================================
 
 # Настройка логов с ротацией (максимум 200 КБ)
 log_handler = RotatingFileHandler("bot_errors.log", encoding='utf-8', maxBytes=200*1024, backupCount=2)
@@ -127,7 +133,6 @@ def get_moscow_time_naive() -> datetime:
 ) = range(36)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
-POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
 MAX_DROP_DEPTH = 80
 
 MAIN_MENU_BUTTONS = [
@@ -371,7 +376,7 @@ class Database:
             ''')
             
             defaults = [
-                ('symbol', 'TONUSDT'),
+                ('symbol', DEFAULT_SYMBOL),
                 ('invest_amount', '5.0'),
                 ('manual_amount', '1.1'),
                 ('profit_percent', '5'),
@@ -988,7 +993,7 @@ class Database:
     
     def get_ladder_settings(self, symbol: str = None) -> Dict:
         if symbol is None:
-            symbol = self.get_setting('symbol', 'TONUSDT')
+            symbol = self.get_setting('symbol', DEFAULT_SYMBOL)
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             conn.row_factory = sqlite3.Row
@@ -1044,7 +1049,7 @@ class Database:
     
     def calculate_ladder_purchase(self, current_price: float, symbol: str = None) -> Dict:
         if symbol is None:
-            symbol = self.get_setting('symbol', 'TONUSDT')
+            symbol = self.get_setting('symbol', DEFAULT_SYMBOL)
         
         stats = self.get_dca_stats(symbol)
         if not stats or stats['total_quantity'] <= 0:
@@ -1101,7 +1106,7 @@ class Database:
     
     def get_recommendation_for_current_drop(self, current_price: float, symbol: str = None, for_manual: bool = False) -> Dict:
         if symbol is None:
-            symbol = self.get_setting('symbol', 'TONUSDT')
+            symbol = self.get_setting('symbol', DEFAULT_SYMBOL)
         
         stats = self.get_dca_stats(symbol)
         
@@ -1151,7 +1156,7 @@ class Database:
     
     def get_ladder_summary(self, symbol: str = None, current_price: float = None) -> Dict:
         if symbol is None:
-            symbol = self.get_setting('symbol', 'TONUSDT')
+            symbol = self.get_setting('symbol', DEFAULT_SYMBOL)
         
         settings = self.get_ladder_settings(symbol)
         stats = self.get_dca_stats(symbol)
@@ -1219,7 +1224,7 @@ class Database:
     
     def reset_ladder(self, symbol: str = None):
         if symbol is None:
-            symbol = self.get_setting('symbol', 'TONUSDT')
+            symbol = self.get_setting('symbol', DEFAULT_SYMBOL)
         self.clear_all_purchases(symbol)
     
     def add_executed_order(self, order_id: str, symbol: str, price: float, quantity: float, amount_usdt: float, executed_at: str = None) -> bool:
@@ -1480,7 +1485,7 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         purchase.get('id'),
-                        purchase.get('symbol', 'TONUSDT'),
+                        purchase.get('symbol', DEFAULT_SYMBOL),
                         purchase.get('amount_usdt', 0),
                         purchase.get('price', 0),
                         purchase.get('quantity', 0),
@@ -1505,7 +1510,7 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         order.get('id'),
-                        order.get('symbol', 'TONUSDT'),
+                        order.get('symbol', DEFAULT_SYMBOL),
                         order.get('order_id', f"imported_{order.get('id', 0)}"),
                         order.get('quantity', 0),
                         order.get('target_price', 0),
@@ -1526,7 +1531,7 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         pending.get('id'),
-                        pending.get('symbol', 'TONUSDT'),
+                        pending.get('symbol', DEFAULT_SYMBOL),
                         pending.get('quantity', 0),
                         pending.get('target_price', 0),
                         pending.get('profit_percent', 5),
@@ -1547,7 +1552,7 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         sell.get('id'),
-                        sell.get('symbol', 'TONUSDT'),
+                        sell.get('symbol', DEFAULT_SYMBOL),
                         sell.get('order_id'),
                         sell.get('quantity', 0),
                         sell.get('sell_price', 0),
@@ -1571,7 +1576,7 @@ class Database:
             if dca_start and dca_start.get('start_date'):
                 try:
                     cursor.execute('INSERT OR REPLACE INTO dca_start (id, start_date, symbol, initial_price) VALUES (1, ?, ?, ?)',
-                                  (dca_start['start_date'], dca_start.get('symbol', 'TONUSDT'), dca_start.get('initial_price', 0)))
+                                  (dca_start['start_date'], dca_start.get('symbol', DEFAULT_SYMBOL), dca_start.get('initial_price', 0)))
                 except Exception:
                     pass
             
@@ -1598,7 +1603,7 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         ladder.get('id'),
-                        ladder.get('symbol', 'TONUSDT'),
+                        ladder.get('symbol', DEFAULT_SYMBOL),
                         ladder.get('max_depth', 80),
                         ladder.get('base_amount', 1.1),
                         ladder.get('max_amount', 3.3),
@@ -1618,7 +1623,7 @@ class Database:
                     ''', (
                         executed.get('id'),
                         executed.get('order_id'),
-                        executed.get('symbol', 'TONUSDT'),
+                        executed.get('symbol', DEFAULT_SYMBOL),
                         executed.get('price', 0),
                         executed.get('quantity', 0),
                         executed.get('amount_usdt', 0),
@@ -4202,7 +4207,7 @@ class FastDCABot:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return
         
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         
         try:
             first_order_date = self.db.get_first_order_date()
@@ -4341,7 +4346,7 @@ class FastDCABot:
             if amount < 5:
                 raise ValueError("Минимальная сумма 5 USDT")
             self.db.set_setting('invest_amount', str(amount))
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
             ladder = self.db.get_ladder_settings(symbol)
             ladder['base_amount'] = amount
             ladder['max_amount'] = amount * 3
@@ -4653,7 +4658,7 @@ class FastDCABot:
             await msg.edit_text("❌ Bybit API не инициализирован.")
             return NOTIFICATION_SETTINGS_MENU
         
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         first_order_date = self.db.get_first_order_date()
         check_date_str = first_order_date.strftime('%d.%m.%Y') if first_order_date else "начала торгов"
         
@@ -4735,7 +4740,7 @@ class FastDCABot:
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return ConversationHandler.END
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         try:
             orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
             sell_count = len(orders_by_side.get('sell', []))
@@ -4763,7 +4768,7 @@ class FastDCABot:
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
             return
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         coin = symbol.replace('USDT', '')
         try:
             orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
@@ -4806,7 +4811,7 @@ class FastDCABot:
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
             return ConversationHandler.END
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         try:
             orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
             all_orders = []
@@ -4846,7 +4851,7 @@ class FastDCABot:
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
             return ConversationHandler.END
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         try:
             all_orders = context.user_data.get('cancel_orders', [])
             if not all_orders:
@@ -4905,7 +4910,7 @@ class FastDCABot:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return
         try:
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
             coin = symbol.replace('USDT', '')
             coin_balance = await self.bybit.get_balance(coin)
             usdt_balance = await self.bybit.get_balance('USDT')
@@ -4951,7 +4956,7 @@ class FastDCABot:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return
         try:
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
             coin = symbol.replace('USDT', '')
             stats = self.db.get_dca_stats(symbol)
             current_price = await self.bybit.get_symbol_price(symbol)
@@ -5008,7 +5013,7 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return
         await self._reset_bot_state(context)
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
         invest_amount = float(self.db.get_setting('invest_amount', '5.0'))
         manual_amount = self.db.get_manual_amount()
@@ -5084,7 +5089,7 @@ class FastDCABot:
             )
             logger.info("DCA stopped by user")
         else:
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
             current_price = await self.bybit.get_symbol_price(symbol)
             if not current_price:
                 await update.message.reply_text("❌ Не удалось получить цену")
@@ -5160,7 +5165,7 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         await self._reset_bot_state(context)
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         profit_percent = self.db.get_setting('profit_percent', '5')
         mode = self.db.get_trading_mode()
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
@@ -5199,7 +5204,7 @@ class FastDCABot:
     async def set_symbol_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return SELECTING_ACTION
-        await update.message.reply_text(f"🪙 Выберите токен или введите свой\nТекущий: {self.db.get_setting('symbol', 'TONUSDT')}", reply_markup=self.get_symbol_selection_keyboard())
+        await update.message.reply_text(f"🪙 Выберите токен или введите свой\nТекущий: {self.db.get_setting('symbol', DEFAULT_SYMBOL)}", reply_markup=self.get_symbol_selection_keyboard())
         return SELECTING_SYMBOL
     
     async def process_symbol_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5271,7 +5276,7 @@ class FastDCABot:
     async def show_ladder_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         ladder = self.db.get_ladder_settings(symbol)
         current_price = await self.bybit.get_symbol_price(symbol) if self.bybit_initialized else None
         summary = self.db.get_ladder_summary(symbol, current_price)
@@ -5310,7 +5315,7 @@ class FastDCABot:
             max_depth = float(text.replace(',', '.'))
             if max_depth < 30 or max_depth > 95:
                 raise ValueError
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
             ladder = self.db.get_ladder_settings(symbol)
             ladder['max_depth'] = max_depth
             self.db.save_ladder_settings(ladder)
@@ -5335,7 +5340,7 @@ class FastDCABot:
             base_amount = float(text.replace(',', '.'))
             if base_amount < 5:
                 raise ValueError("Минимальная сумма 5 USDT")
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
             ladder = self.db.get_ladder_settings(symbol)
             ladder['base_amount'] = base_amount
             ladder['max_amount'] = base_amount * 3
@@ -5349,7 +5354,7 @@ class FastDCABot:
     async def reset_ladder(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         self.db.reset_ladder(symbol)
         await update.message.reply_text("🔄 Статистика DCA очищена! Лестница сброшена.\n⚠️ ID покупок будут начинаться с 1 при следующем добавлении.", reply_markup=self.get_ladder_settings_keyboard())
         return LADDER_MENU
@@ -5362,7 +5367,7 @@ class FastDCABot:
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return ConversationHandler.END
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         current_price = await self.bybit.get_symbol_price(symbol)
         if not current_price:
             await update.message.reply_text("❌ Не удалось получить цену", reply_markup=self.get_main_keyboard())
@@ -5430,7 +5435,7 @@ class FastDCABot:
             if amount < 1.1:
                 raise ValueError("Минимальная сумма 1.1 USDT")
             price = context.user_data.get('manual_buy_price')
-            symbol = context.user_data.get('manual_buy_symbol', 'TONUSDT')
+            symbol = context.user_data.get('manual_buy_symbol', DEFAULT_SYMBOL)
             recommendation = context.user_data.get('manual_buy_recommendation', {})
             if not price:
                 await update.message.reply_text("❌ Ошибка", reply_markup=self.get_main_keyboard())
@@ -5486,7 +5491,7 @@ class FastDCABot:
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return ConversationHandler.END
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         current_price = await self.bybit.get_symbol_price(symbol)
         stats = self.db.get_dca_stats(symbol)
         
@@ -5527,7 +5532,7 @@ class FastDCABot:
             if price <= 0:
                 raise ValueError("Цена должна быть положительной")
             context.user_data['manual_price'] = price
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
             stats = self.db.get_dca_stats(symbol)
             
             recommendation = self.db.get_recommendation_for_current_drop(price, symbol, for_manual=True)
@@ -5575,7 +5580,7 @@ class FastDCABot:
                 await self._reset_bot_state(context)
                 await update.message.reply_text("❌ Ошибка: цена не найдена. Попробуйте заново.", reply_markup=self.get_main_keyboard())
                 return ConversationHandler.END
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
             amount_usdt = price * quantity
             stats = self.db.get_dca_stats(symbol)
             drop_percent = 0
@@ -5601,7 +5606,7 @@ class FastDCABot:
             return ConversationHandler.END
         await self._reset_bot_state(context)
         context.user_data.pop('editing_purchase_id', None)
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         purchases = self.db.get_purchases(symbol)
         if not purchases:
             await update.message.reply_text("Нет покупок", reply_markup=self.get_main_keyboard())
@@ -5623,7 +5628,7 @@ class FastDCABot:
             import re
             match = re.search(r'ID(\d+)', text)
             if not match:
-                await update.message.reply_text("❌ Неверный формат.", reply_markup=self.get_purchases_list_keyboard(self.db.get_purchases(self.db.get_setting('symbol', 'TONUSDT'))))
+                await update.message.reply_text("❌ Неверный формат.", reply_markup=self.get_purchases_list_keyboard(self.db.get_purchases(self.db.get_setting('symbol', DEFAULT_SYMBOL))))
                 return EDIT_PURCHASE_SELECT
             purchase_id = int(match.group(1))
             purchase = self.db.get_purchase_by_id(purchase_id)
@@ -5661,7 +5666,7 @@ class FastDCABot:
                 await update.message.reply_text("❌ Покупка не найдена", reply_markup=self.get_main_keyboard())
                 return ConversationHandler.END
             new_amount_usdt = new_price * purchase['quantity']
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
             stats = self.db.get_dca_stats(symbol)
             new_drop_percent = calculate_current_drop(new_price, stats['avg_price']) if stats else 0
             if self.db.update_purchase(purchase_id, price=new_price, amount_usdt=new_amount_usdt, drop_percent=new_drop_percent):
@@ -5858,7 +5863,7 @@ class FastDCABot:
                     continue
                 
                 if now >= next_time:
-                    symbol = self.db.get_setting('symbol', 'TONUSDT')
+                    symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
                     profit_percent = float(self.db.get_setting('profit_percent', '5'))
                     
                     logger.info(f"Scheduled purchase triggered at {now.isoformat()}")
@@ -5904,7 +5909,7 @@ class FastDCABot:
                     self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
                     logger.info(f"Next purchase scheduled at {next_time.isoformat()}")
                 
-                current_symbol = self.db.get_setting('symbol', 'TONUSDT')
+                current_symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
                 await self.strategy.check_and_update_sell_orders(current_symbol)
                 
                 if self.authorized_user_id:
@@ -5930,7 +5935,7 @@ class FastDCABot:
                 if not self.bybit_initialized:
                     await asyncio.sleep(interval_minutes * 60)
                     continue
-                symbol = self.db.get_setting('symbol', 'TONUSDT')
+                symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
                 if self.authorized_user_id:
                     result = await self.strategy.auto_check_and_notify(symbol, self.authorized_user_id, self.application.bot)
                     if result['count'] > 0:
@@ -5956,7 +5961,7 @@ class FastDCABot:
                 if not self.bybit_initialized:
                     await asyncio.sleep(3600)
                     continue
-                symbol = self.db.get_setting('symbol', 'TONUSDT')
+                symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
                 if self.authorized_user_id:
                     completed_sells = await self.strategy.check_completed_sells(symbol, self.authorized_user_id, self.application.bot)
                     if completed_sells:
@@ -5979,7 +5984,7 @@ class FastDCABot:
                 if not self.bybit_initialized:
                     await asyncio.sleep(1800)
                     continue
-                symbol = self.db.get_setting('symbol', 'TONUSDT')
+                symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
                 if self.authorized_user_id:
                     executed = await self.strategy.check_pending_sell_orders(symbol, self.authorized_user_id, self.application.bot)
                     if executed:
@@ -6022,7 +6027,7 @@ class FastDCABot:
                         should_notify = True
                 
                 if should_notify and self.authorized_user_id:
-                    symbol = self.db.get_setting('symbol', 'TONUSDT')
+                    symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
                     current_price = await self.bybit.get_symbol_price(symbol)
                     if current_price:
                         stats = self.db.get_dca_stats(symbol)
@@ -6071,7 +6076,7 @@ class FastDCABot:
             await asyncio.sleep(60)
     
     async def send_sell_recommendation_from_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         profit_percent = float(self.db.get_setting('profit_percent', '5'))
         stats = self.db.get_dca_stats(symbol)
         if not stats:
@@ -6300,7 +6305,7 @@ class FastDCABot:
         self.background_tasks = [task1, task2, task3, task4, task5, task6]
         
         if self.db.get_setting('dca_active', 'false') == 'true':
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
             if self.bybit_initialized and self.authorized_user_id:
                 stats = self.db.get_dca_stats(symbol)
                 if stats and stats['total_quantity'] > 0:
