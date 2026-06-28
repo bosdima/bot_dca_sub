@@ -3953,7 +3953,7 @@ class FastDCABot:
                     if self.bybit_initialized:
                         await self.check_api_and_notify(is_startup=False)
                 
-                await asyncio.sleep(6 * 3600)
+                await asyncio.sleep(1 * 3600)
                 
             except asyncio.CancelledError:
                 logger.info("API check loop cancelled")
