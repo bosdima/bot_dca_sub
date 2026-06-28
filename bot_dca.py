@@ -2,13 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.12.1 (27.06.2026)
+Версия 5.13.0 (28.06.2026)
 ИСПРАВЛЕНИЯ:
-- Исправлена работа с суб-аккаунтами Bybit (UNIFIED аккаунт)
-- Исправлена логика создания ордера на продажу - только при наличии покупок
-- Улучшена обработка баланса для разных типов аккаунтов
-- Исправлены ошибки при запуске DCA без истории покупок
-- ИСПРАВЛЕНИЕ: динамическое определение точности количества для продажи (qty_decimals из инструмента)
+- Добавлена проверка API ключа при старте и каждые 6 часов
+- Уведомления об истечении API ключа
+- Автоматическое восстановление при смене ключа
+- Команда /check_api для ручной проверки
 """
 
 import os
@@ -72,7 +71,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.12.1 (27.06.2026)"
+BOT_VERSION = "5.13.0 (28.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -400,6 +399,9 @@ class Database:
                 ('first_order_date', ''),
                 ('next_dca_purchase_time', ''),
                 ('trading_mode', 'real'),
+                ('last_api_check_time', ''),
+                ('api_status', 'unknown'),
+                ('api_error_message', ''),
             ]
             
             for key, value in defaults:
@@ -937,6 +939,30 @@ class Database:
     
     def set_manual_amount(self, amount: float):
         self.set_setting('manual_amount', str(amount))
+    
+    def get_last_api_check_time(self) -> Optional[datetime]:
+        time_str = self.get_setting('last_api_check_time', '')
+        if time_str:
+            try:
+                return datetime.fromisoformat(time_str)
+            except:
+                return None
+        return None
+    
+    def set_last_api_check_time(self, check_time: datetime):
+        self.set_setting('last_api_check_time', check_time.isoformat())
+    
+    def get_api_status(self) -> str:
+        return self.get_setting('api_status', 'unknown')
+    
+    def set_api_status(self, status: str):
+        self.set_setting('api_status', status)
+    
+    def get_api_error_message(self) -> str:
+        return self.get_setting('api_error_message', '')
+    
+    def set_api_error_message(self, message: str):
+        self.set_setting('api_error_message', message)
     
     def log_action(self, action: str, symbol: str = None, details: str = None):
         try:
@@ -1627,7 +1653,7 @@ class BybitClient:
         self._cache_ttl = 5
         self._instrument_cache = {}
         self._instrument_cache_time = {}
-        self._instrument_cache_ttl = 3600  # 1 час
+        self._instrument_cache_ttl = 3600
         self._init_session()
     
     def _init_session(self):
@@ -1636,6 +1662,55 @@ class BybitClient:
             logger.info(f"Bybit session initialized (testnet={self.testnet})")
         except Exception as e:
             logger.error(f"Session init error: {e}")
+    
+    async def check_api_health(self) -> Dict:
+        """Проверяет работоспособность API ключа"""
+        try:
+            if not self.session:
+                self._init_session()
+                if not self.session:
+                    return {
+                        'success': False,
+                        'error': 'Не удалось инициализировать сессию',
+                        'user_message': 'Ошибка инициализации API',
+                        'is_api_error': True
+                    }
+            
+            response = self.session.get_wallet_balance(accountType="UNIFIED")
+            
+            if response['retCode'] == 0:
+                return {'success': True, 'message': 'API ключ работает'}
+            else:
+                error_code = response.get('retCode', 0)
+                error_msg = response.get('retMsg', 'Неизвестная ошибка')
+                
+                error_descriptions = {
+                    10003: 'API ключ не найден',
+                    10004: 'API ключ истек (expired)',
+                    10005: 'Неверный API ключ или секрет',
+                    10006: 'Недостаточно прав для этого действия',
+                    10010: 'IP-адрес не в белом списке',
+                    10016: 'Превышен лимит запросов',
+                }
+                
+                user_message = error_descriptions.get(error_code, error_msg)
+                
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'error_code': error_code,
+                    'user_message': user_message,
+                    'is_api_error': error_code in [10003, 10004, 10005, 10006, 10010, 10016]
+                }
+                
+        except Exception as e:
+            logger.error(f"API health check error: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'user_message': f'Ошибка соединения: {str(e)[:100]}',
+                'is_api_error': True
+            }
     
     async def get_symbol_price(self, symbol: str) -> Optional[float]:
         now = time.time()
@@ -1674,15 +1749,10 @@ class BybitClient:
             return 0, []
     
     async def get_balance(self, coin: str = None) -> Dict:
-        """
-        Получение баланса с поддержкой UNIFIED аккаунтов (суб-аккаунты).
-        Bybit требует accountType="UNIFIED" для суб-аккаунтов.
-        """
         try:
             if not self.session:
                 self._init_session()
             
-            # Пробуем UNIFIED (работает для всех аккаунтов, включая суб-аккаунты)
             try:
                 response = self.session.get_wallet_balance(accountType="UNIFIED")
                 if response['retCode'] == 0:
@@ -1703,14 +1773,12 @@ class BybitClient:
                                     return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
                             
                             logger.warning(f"Coin {coin} not found in UNIFIED response")
-                            # Если монета не найдена, возвращаем 0 баланс
                             return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
                         else:
                             total_equity = float(account_data.get('totalEquity', 0) or 0)
                             return {'total_equity': total_equity, 'coins': coins}
             except Exception as e:
                 logger.warning(f"Error getting balance with UNIFIED: {e}")
-                # Если UNIFIED не сработал, пробуем SPOT
                 try:
                     response = self.session.get_wallet_balance(accountType="SPOT")
                     if response['retCode'] == 0:
@@ -1782,7 +1850,6 @@ class BybitClient:
             return []
     
     async def get_instrument_info(self, symbol: str) -> Dict:
-        """Получение информации о инструменте с кешированием"""
         now = time.time()
         if symbol in self._instrument_cache_time and now - self._instrument_cache_time.get(symbol, 0) < self._instrument_cache_ttl:
             return self._instrument_cache.get(symbol, {})
@@ -1853,16 +1920,6 @@ class BybitClient:
         return round(rounded, decimals)
     
     def _round_quantity_for_sell(self, quantity: float, qty_decimals: int = SELL_DECIMALS_FALLBACK) -> float:
-        """
-        Округление количества для продажи с заданной точностью.
-        
-        Args:
-            quantity: Количество для округления
-            qty_decimals: Количество знаков после запятой (из инструмента)
-        
-        Returns:
-            Округленное количество
-        """
         if quantity <= 0:
             return 0.0
         
@@ -1988,7 +2045,6 @@ class BybitClient:
             
             rounded_price = self._round_price_by_tick(price, tick_size)
             
-            # Используем точность из инструмента
             rounded_quantity = self._round_quantity_for_sell(quantity, qty_decimals)
             
             if rounded_quantity < min_qty and quantity >= min_qty:
@@ -2022,7 +2078,6 @@ class BybitClient:
             if response['retCode'] == 170131:
                 return {'success': False, 'error': 'insufficient_balance', 'message': response['retMsg']}
             if response['retCode'] == 170137:
-                # Пробуем уменьшить точность
                 for decimals in range(qty_decimals - 1, 0, -1):
                     factor = 10 ** decimals
                     retry_quantity = math.floor(rounded_quantity * factor) / factor
@@ -2185,13 +2240,11 @@ class DCAStrategy:
             logger.error(f"Error sending purchase skipped notification: {e}")
     
     async def check_and_create_sell_order(self, symbol: str, bot, silent: bool = False) -> Dict:
-        """Проверяет и создает ордер на продажу ТОЛЬКО если есть покупки"""
         try:
             coin = symbol.replace('USDT', '')
             
             stats = self.db.get_dca_stats(symbol)
             
-            # Если нет покупок - не создаем ордер на продажу
             if not stats or stats['total_quantity'] <= 0:
                 error_msg = 'Нет статистики DCA для расчета цены (нет покупок)'
                 logger.info(f"No purchases for {symbol}, skipping sell order creation")
@@ -2540,7 +2593,6 @@ class DCAStrategy:
                 'reason': f'Минимальная сумма ордера: {min_amt} USDT'
             }
         elif result.get('error') == 'quantity_decimals_error':
-            # Пробуем уменьшить точность
             for decimals in range(qty_decimals - 1, 0, -1):
                 factor = 10 ** decimals
                 retry_quantity = math.floor(rounded_quantity * factor) / factor
@@ -2936,7 +2988,6 @@ class DCAStrategy:
                 if rounded_price <= 0:
                     rounded_price = tick_size
                 
-                # Обновляем количество с правильной точностью
                 quantity = self.bybit._round_quantity_for_sell(order['quantity'], qty_decimals)
                 
                 sell_result = await self._try_place_sell_order(symbol, quantity, rounded_price, order['profit_percent'], bot)
@@ -3697,7 +3748,6 @@ class DCAStrategy:
                     await update.message.reply_text(msg, parse_mode='Markdown')
                 return {'success': False, 'pending': True, 'pending_id': pending_id, 'error': result.get('error'), 'message': msg}
             elif result.get('error') == 'quantity_decimals_error':
-                # Пробуем уменьшить точность
                 for decimals in range(qty_decimals - 1, 0, -1):
                     factor = 10 ** decimals
                     retry_qty = math.floor(sell_qty * factor) / factor
@@ -3739,6 +3789,9 @@ class FastDCABot:
         self.scheduler_running = False
         self.background_tasks = []
         self._sell_check_task = None
+        self._api_check_task = None
+        self._api_was_working = False
+        self._api_error_count = 0
         
         request_kwargs = {'connect_timeout': 60.0, 'read_timeout': 60.0, 'write_timeout': 60.0, 'pool_timeout': 60.0}
         request = HTTPXRequest(**request_kwargs)
@@ -3760,6 +3813,140 @@ class FastDCABot:
                 logger.info(f"Bybit client initialized (demo={testnet})")
             except Exception as e:
                 logger.error(f"Bybit init error: {e}")
+    
+    async def check_api_and_notify(self, is_startup: bool = False) -> bool:
+        """Проверяет API и отправляет уведомления"""
+        if not self.bybit_initialized:
+            self._init_bybit()
+            if not self.bybit_initialized:
+                return False
+        
+        health = await self.bybit.check_api_health()
+        user_id = self.authorized_user_id
+        
+        if health['success']:
+            if not self._api_was_working:
+                self._api_was_working = True
+                self._api_error_count = 0
+                self.db.set_api_status('working')
+                self.db.set_api_error_message('')
+                
+                if user_id and not is_startup:
+                    message = (
+                        f"✅ *Бот запущен и готов к работе!*\n"
+                        f"🌐 Доступ к бирже Bybit по API ключу работает\n\n"
+                        f"🔄 API ключ восстановлен и работает корректно.\n"
+                        f"🕐 Время проверки: `{get_moscow_time().strftime('%H:%M:%S')}`"
+                    )
+                    try:
+                        await self.application.bot.send_message(
+                            chat_id=user_id,
+                            text=message,
+                            parse_mode='Markdown'
+                        )
+                        logger.info("API recovery notification sent")
+                    except Exception as e:
+                        logger.error(f"Error sending API recovery notification: {e}")
+            return True
+        else:
+            self._api_was_working = False
+            self._api_error_count += 1
+            self.db.set_api_status('error')
+            self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
+            
+            if user_id:
+                if is_startup or self._api_error_count % 3 == 0:
+                    error_code = health.get('error_code', 'N/A')
+                    user_message = health.get('user_message', 'Неизвестная ошибка')
+                    
+                    message = (
+                        f"🚨 *КРИТИЧЕСКАЯ ОШИБКА API BYBIT!*\n\n"
+                        f"❌ Статус: `НЕ РАБОТАЕТ`\n"
+                        f"📝 Ошибка: `{user_message}`\n"
+                        f"🔢 Код: `{error_code}`\n\n"
+                        f"⚠️ *Что делать:*\n"
+                        f"1️⃣ Проверьте API ключ в файле `.env`\n"
+                        f"2️⃣ Убедитесь, что ключ активен (выдается на 90 дней)\n"
+                        f"3️⃣ Проверьте права доступа (нужны: spot trade, wallet read)\n"
+                        f"4️⃣ Проверьте IP в белом списке Bybit\n\n"
+                        f"🔄 Бот будет проверять доступ каждые 6 часов.\n"
+                        f"📋 Следующая проверка: через 6 часов."
+                    )
+                    try:
+                        await self.application.bot.send_message(
+                            chat_id=user_id,
+                            text=message,
+                            parse_mode='Markdown'
+                        )
+                        logger.info(f"API error notification sent (attempt {self._api_error_count})")
+                    except Exception as e:
+                        logger.error(f"Error sending API error notification: {e}")
+            return False
+    
+    async def api_check_loop(self):
+        """Цикл проверки API каждые 6 часов"""
+        logger.info("API check loop started (every 6 hours)")
+        
+        await asyncio.sleep(60)
+        
+        while self.scheduler_running:
+            try:
+                if self.bybit_initialized:
+                    await self.check_api_and_notify(is_startup=False)
+                else:
+                    self._init_bybit()
+                    if self.bybit_initialized:
+                        await self.check_api_and_notify(is_startup=False)
+                
+                await asyncio.sleep(6 * 3600)
+                
+            except asyncio.CancelledError:
+                logger.info("API check loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"API check loop error: {e}")
+                await asyncio.sleep(300)
+    
+    async def cmd_check_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /check_api для ручной проверки API"""
+        if not await self._check_user_fast(update):
+            return
+        
+        await update.message.reply_text("🔍 Проверяю API ключ...")
+        
+        self._init_bybit()
+        if not self.bybit_initialized:
+            await update.message.reply_text("❌ API не инициализирован. Проверьте .env файл.")
+            return
+        
+        health = await self.bybit.check_api_health()
+        
+        if health['success']:
+            self._api_was_working = True
+            self.db.set_api_status('working')
+            self.db.set_api_error_message('')
+            await update.message.reply_text(
+                "✅ *API Bybit работает корректно!*\n\n"
+                "🔑 Ключ активен и имеет необходимые права.\n"
+                f"🕐 Время проверки: `{get_moscow_time().strftime('%H:%M:%S')}`",
+                parse_mode='Markdown'
+            )
+        else:
+            error_code = health.get('error_code', 'N/A')
+            user_message = health.get('user_message', 'Неизвестная ошибка')
+            
+            message = (
+                f"🚨 *КРИТИЧЕСКАЯ ОШИБКА API BYBIT!*\n\n"
+                f"❌ Статус: `НЕ РАБОТАЕТ`\n"
+                f"📝 Ошибка: `{user_message}`\n"
+                f"🔢 Код: `{error_code}`\n\n"
+                f"⚠️ *Что делать:*\n"
+                f"1️⃣ Проверьте API ключ в файле `.env`\n"
+                f"2️⃣ Убедитесь, что ключ активен (выдается на 90 дней)\n"
+                f"3️⃣ Проверьте права доступа (нужны: spot trade, wallet read)\n"
+                f"4️⃣ Проверьте IP в белом списке Bybit"
+            )
+            await update.message.reply_text(message, parse_mode='Markdown')
     
     def get_main_keyboard(self):
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
@@ -3943,15 +4130,56 @@ class FastDCABot:
         current_time = get_moscow_time()
         mode = self.db.get_trading_mode()
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
-        await update.message.reply_text(
+        
+        api_status_text = "❌ НЕ РАБОТАЕТ"
+        health = None
+        if self.bybit_initialized:
+            health = await self.bybit.check_api_health()
+            if health['success']:
+                api_status_text = "✅ РАБОТАЕТ"
+                self._api_was_working = True
+                self.db.set_api_status('working')
+            else:
+                api_status_text = f"❌ {health.get('user_message', 'Ошибка')}"
+                self._api_was_working = False
+                self.db.set_api_status('error')
+                self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
+        else:
+            self._init_bybit()
+            if self.bybit_initialized:
+                health = await self.bybit.check_api_health()
+                if health['success']:
+                    api_status_text = "✅ РАБОТАЕТ"
+                    self._api_was_working = True
+                    self.db.set_api_status('working')
+                else:
+                    api_status_text = f"❌ {health.get('user_message', 'Ошибка')}"
+                    self._api_was_working = False
+                    self.db.set_api_status('error')
+                    self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
+        
+        start_message = (
             f"👋 Привет, {update.effective_user.first_name}!\n\n"
             f"🤖 DCA Bybit Bot (Мартингейл лесенкой)\n"
             f"📌 Версия: {BOT_VERSION}\n"
             f"🌐 Режим: {mode_text}\n"
             f"🕐 Московское время: {current_time.strftime('%H:%M')}\n\n"
-            f"Главное меню:",
-            reply_markup=self.get_main_keyboard()
+            f"🔑 *Статус API Bybit:* {api_status_text}\n\n"
+            f"✅ Бот запущен и готов к работе!\n"
+            f"🌐 Доступ к бирже Bybit по API ключу {api_status_text.split()[0]}\n\n"
+            f"📋 Уведомления об исполненных ордерах будут приходить сюда.\n"
+            f"🔄 Проверка API выполняется каждые 6 часов."
         )
+        
+        await update.message.reply_text(
+            start_message,
+            reply_markup=self.get_main_keyboard(),
+            parse_mode='Markdown'
+        )
+        
+        if self.bybit_initialized and health and not health['success']:
+            await self.check_api_and_notify(is_startup=True)
+        
         if self.authorized_user_id:
             try:
                 await self.application.bot.send_message(
@@ -4796,8 +5024,13 @@ class FastDCABot:
         next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
         mode = self.db.get_trading_mode()
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
+        api_status = self.db.get_api_status()
+        api_error = self.db.get_api_error_message()
+        api_status_text = "✅ Работает" if api_status == 'working' else f"❌ {api_error if api_error else 'Неизвестно'}"
+        
         message = f"📋 *Статус бота*\n\n"
         message += f"🌐 Режим: {mode_text}\n"
+        message += f"🔑 API Bybit: {api_status_text}\n"
         message += f"🤖 Статус: {'✅ Активен' if is_active else '⏹ Остановлен'}\n"
         if is_active and next_purchase_str:
             try:
@@ -4867,7 +5100,6 @@ class FastDCABot:
                 parse_mode='Markdown'
             )
             
-            # Проверяем наличие покупок перед созданием ордера
             stats = self.db.get_dca_stats(symbol)
             if not stats or stats['total_quantity'] <= 0:
                 await update.message.reply_text(
@@ -5122,7 +5354,6 @@ class FastDCABot:
         await update.message.reply_text("🔄 Статистика DCA очищена! Лестница сброшена.\n⚠️ ID покупок будут начинаться с 1 при следующем добавлении.", reply_markup=self.get_ladder_settings_keyboard())
         return LADDER_MENU
     
-    # Ручные покупки
     async def manual_buy_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -5247,7 +5478,6 @@ class FastDCABot:
             return MANUAL_BUY_AMOUNT
         return ConversationHandler.END
     
-    # Добавление покупки вручную
     async def manual_add_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -5366,7 +5596,6 @@ class FastDCABot:
             await update.message.reply_text(f"❌ Ошибка! Введите корректное количество.\nПример: 10.5 или 10,5\n\nОшибка: {str(e)}", reply_markup=self.get_cancel_keyboard())
             return MANUAL_ADD_AMOUNT
     
-    # Редактирование покупок
     async def edit_purchases_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -6053,22 +6282,26 @@ class FastDCABot:
         await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
     
     async def post_init(self, application: Application):
-        logger.info("Bot initialized, scheduler loops started")
+        logger.info("Bot initialized, starting scheduler loops...")
         self.scheduler_running = True
+        
+        self._init_bybit()
+        
+        if self.bybit_initialized:
+            await self.check_api_and_notify(is_startup=True)
         
         task1 = asyncio.create_task(self.dca_scheduler_loop())
         task2 = asyncio.create_task(self.order_checker_loop())
         task3 = asyncio.create_task(self.sell_checker_loop())
         task4 = asyncio.create_task(self.pending_sell_checker_loop())
         task5 = asyncio.create_task(self.purchase_notify_loop())
+        task6 = asyncio.create_task(self.api_check_loop())
         
-        self.background_tasks = [task1, task2, task3, task4, task5]
+        self.background_tasks = [task1, task2, task3, task4, task5, task6]
         
         if self.db.get_setting('dca_active', 'false') == 'true':
             symbol = self.db.get_setting('symbol', 'TONUSDT')
-            self._init_bybit()
             if self.bybit_initialized and self.authorized_user_id:
-                # Проверяем наличие покупок перед созданием ордера
                 stats = self.db.get_dca_stats(symbol)
                 if stats and stats['total_quantity'] > 0:
                     await self.strategy.check_and_create_sell_order(symbol, self.application.bot, silent=False)
@@ -6098,6 +6331,7 @@ class FastDCABot:
     def setup_handlers(self):
         logger.info("Setting up handlers...")
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
+        self.application.add_handler(CommandHandler("check_api", self.cmd_check_api))
         self.application.add_handler(CommandHandler("check_sells", self.cmd_check_sells))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_|clear_stats_|skip_clear_|do_clear_|cancel_clear_|confirm_clear_stats_|skip_clear_stats_)'))
         self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export))
