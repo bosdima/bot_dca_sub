@@ -2,13 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.15.0 (28.06.2026)
+Версия 5.15.1 (28.06.2026)
 ИСПРАВЛЕНИЯ:
 - Добавлено динамическое чтение API ключей из .env при каждом обращении
 - Добавлена команда /refresh_api для принудительного обновления ключей
 - Исправлена проблема с кэшированием ключей при их изменении
 - Улучшена обработка ошибок API
-- Исправлена ошибка shutdown
 """
 
 import os
@@ -91,8 +90,8 @@ def get_moscow_time_naive() -> datetime:
     return datetime.now(MOSCOW_TZ).replace(tzinfo=None)
 
 def get_api_keys():
-    """Получает актуальные ключи из .env при каждом вызове"""
-    load_dotenv()
+    """Получает актуальные ключи из .env при каждом вызове (с принудительным перезаписыванием)"""
+    load_dotenv(override=True)  # ✅ override=True — ключ к решению
     api_key = os.getenv('BYBIT_API_KEY')
     api_secret = os.getenv('BYBIT_API_SECRET')
     return api_key, api_secret
@@ -1684,11 +1683,24 @@ class BybitClient:
             self.session = None
     
     def _refresh_session(self):
-        """Принудительно обновляет сессию"""
-        logger.info("Refreshing Bybit session...")
-        self.session = None
-        self._init_session()
-        return self.session is not None
+        """Принудительно обновляет сессию с актуальными ключами из .env"""
+        # Запоминаем старый ключ для сравнения
+        old_key_preview = (self.api_key[:8] + "..." + self.api_key[-4:]) if self.api_key and len(self.api_key) > 12 else (self.api_key or "None")
+    
+       # Перечитываем .env и получаем свежие ключи (внутри _init_session вызывается get_api_keys() с override=True)
+       self.session = None
+       self._init_session()
+    
+       # Запоминаем новый ключ
+       new_key_preview = (self.api_key[:8] + "..." + self.api_key[-4:]) if self.api_key and len(self.api_key) > 12 else (self.api_key or "None")
+    
+       # Логируем результат
+       if old_key_preview != new_key_preview:
+        logger.info(f"🔄 API ключ ИЗМЕНЁН! Старый: {old_key_preview} → Новый: {new_key_preview}")
+       else:
+        logger.info(f"🔄 API ключ не изменился: {new_key_preview}")
+    
+       return self.session is not None
     
     def _is_api_available(self) -> bool:
         """Проверяет, доступен ли API (ключи есть и сессия создана)"""
@@ -2911,6 +2923,7 @@ class DCAStrategy:
         
         return result
     
+    # Продолжение DCAStrategy...
     async def execute_ladder_purchase(self, symbol: str, profit_percent: float, bot) -> Dict:
         current_price = await self.bybit.get_symbol_price(symbol)
         if not current_price:
@@ -3877,8 +3890,7 @@ class FastDCABot:
         self.setup_handlers()
     
     def _init_bybit(self, force_reload: bool = False):
-        """Инициализация Bybit с актуальными ключами из .env"""
-        api_key, api_secret = get_api_keys()  # Всегда читаем свежие ключи
+        api_key, api_secret = get_api_keys()
         
         if not api_key or not api_secret:
             logger.warning("API keys missing in .env")
@@ -3891,13 +3903,12 @@ class FastDCABot:
             self.bybit = BybitClient(api_key, api_secret, testnet)
             self.strategy = DCAStrategy(self.db, self.bybit)
             self.bybit_initialized = True
-            logger.info(f"Bybit client initialized with fresh keys (demo={testnet})")
+            logger.info(f"Bybit client initialized (demo={testnet})")
         except Exception as e:
             logger.error(f"Bybit init error: {e}")
             self.bybit_initialized = False
     
     def refresh_api_session(self):
-        """Принудительно обновляет сессию Bybit с новыми ключами"""
         logger.info("Refreshing API session...")
         self.bybit_initialized = False
         self.bybit = None
@@ -3905,7 +3916,6 @@ class FastDCABot:
         return self.bybit_initialized
     
     async def check_api_and_notify(self, is_startup: bool = False) -> bool:
-        """Проверяет API с актуальными ключами"""
         self.refresh_api_session()
         
         if not self.bybit_initialized:
@@ -3925,8 +3935,9 @@ class FastDCABot:
                 
                 if user_id and not is_startup:
                     message = (
-                        f"✅ *API Bybit восстановлен!*\n\n"
-                        f"🔑 Ключи работают корректно.\n"
+                        f"✅ *Бот запущен и готов к работе!*\n"
+                        f"🌐 Доступ к бирже Bybit по API ключу работает\n\n"
+                        f"🔄 API ключ восстановлен и работает корректно.\n"
                         f"🕐 Время проверки: `{get_moscow_time().strftime('%H:%M:%S')}`"
                     )
                     try:
@@ -3945,43 +3956,42 @@ class FastDCABot:
             self.db.set_api_status('error')
             self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
             
-            if user_id and (is_startup or self._api_error_count % 3 == 0):
-                error_code = health.get('error_code', 'N/A')
-                user_message = health.get('user_message', 'Неизвестная ошибка')
-                
-                message = (
-                    f"🚨 *ОШИБКА API BYBIT!*\n\n"
-                    f"❌ Статус: `НЕ РАБОТАЕТ`\n"
-                    f"📝 Ошибка: `{user_message}`\n"
-                    f"🔢 Код: `{error_code}`\n\n"
-                    f"⚠️ *Что делать:*\n"
-                    f"1️⃣ Проверьте API ключ в файле `.env`\n"
-                    f"2️⃣ Убедитесь, что ключ активен\n"
-                    f"3️⃣ Проверьте права доступа\n"
-                    f"4️⃣ Проверьте IP в белом списке Bybit\n\n"
-                    f"🔄 Бот будет проверять доступ каждые 6 часов."
-                )
-                try:
-                    await self.application.bot.send_message(
-                        chat_id=user_id,
-                        text=message,
-                        parse_mode='Markdown'
+            if user_id:
+                if is_startup or self._api_error_count % 3 == 0:
+                    error_code = health.get('error_code', 'N/A')
+                    user_message = health.get('user_message', 'Неизвестная ошибка')
+                    
+                    message = (
+                        f"🚨 *КРИТИЧЕСКАЯ ОШИБКА API BYBIT!*\n\n"
+                        f"❌ Статус: `НЕ РАБОТАЕТ`\n"
+                        f"📝 Ошибка: `{user_message}`\n"
+                        f"🔢 Код: `{error_code}`\n\n"
+                        f"⚠️ *Что делать:*\n"
+                        f"1️⃣ Проверьте API ключ в файле `.env`\n"
+                        f"2️⃣ Убедитесь, что ключ активен (выдается на 90 дней)\n"
+                        f"3️⃣ Проверьте права доступа (нужны: spot trade, wallet read)\n"
+                        f"4️⃣ Проверьте IP в белом списке Bybit\n\n"
+                        f"🔄 Бот будет проверять доступ каждые 6 часов.\n"
+                        f"📋 Следующая проверка: через 6 часов."
                     )
-                    logger.info(f"API error notification sent (attempt {self._api_error_count})")
-                except Exception as e:
-                    logger.error(f"Error sending API error notification: {e}")
+                    try:
+                        await self.application.bot.send_message(
+                            chat_id=user_id,
+                            text=message,
+                            parse_mode='Markdown'
+                        )
+                        logger.info(f"API error notification sent (attempt {self._api_error_count})")
+                    except Exception as e:
+                        logger.error(f"Error sending API error notification: {e}")
             return False
     
     async def api_check_loop(self):
-        """Цикл проверки API каждые 6 часов"""
         logger.info("API check loop started (every 6 hours)")
         
         await asyncio.sleep(60)
         
         while self.scheduler_running:
             try:
-                self.refresh_api_session()
-                
                 if self.bybit_initialized:
                     await self.check_api_and_notify(is_startup=False)
                 else:
@@ -3999,14 +4009,12 @@ class FastDCABot:
                 await asyncio.sleep(300)
     
     async def cmd_check_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /check_api для ручной проверки API"""
         if not await self._check_user_fast(update):
             return
         
         await update.message.reply_text("🔍 Проверяю API ключ...")
         
         self.refresh_api_session()
-        
         if not self.bybit_initialized:
             await update.message.reply_text("❌ API не инициализирован. Проверьте .env файл.")
             return
@@ -4039,39 +4047,30 @@ class FastDCABot:
                 f"4️⃣ Проверьте IP в белом списке Bybit"
             )
             await update.message.reply_text(message, parse_mode='Markdown')
-    
+
     async def cmd_refresh_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /refresh_api для принудительного обновления ключей"""
         if not await self._check_user_fast(update):
             return
-        
         await update.message.reply_text("🔄 Обновляю API ключи из .env...")
-        
-        load_dotenv()
+        load_dotenv(override=True)
         api_key = os.getenv('BYBIT_API_KEY')
         api_secret = os.getenv('BYBIT_API_SECRET')
-        
         if not api_key or not api_secret:
             await update.message.reply_text("❌ Ключи не найдены в .env файле!")
             return
-        
         await update.message.reply_text(f"✅ Ключи найдены:\nAPI Key: {api_key[:8]}...{api_key[-4:]}")
-        
         self.refresh_api_session()
-        
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Не удалось создать сессию Bybit")
             return
-        
         await update.message.reply_text("🔍 Проверяю работоспособность ключей...")
         health = await self.bybit.check_api_health()
-        
         if health['success']:
             self._api_was_working = True
             self.db.set_api_status('working')
             self.db.set_api_error_message('')
             await update.message.reply_text(
-                "✅ *API Bybit работает корректно!*\n\n"
+                "✅ *API Bybit работает корректно!*\n"
                 "🔑 Ключи актуальны и имеют необходимые права.",
                 parse_mode='Markdown'
             )
@@ -4079,30 +4078,12 @@ class FastDCABot:
             error_code = health.get('error_code', 'N/A')
             user_message = health.get('user_message', 'Неизвестная ошибка')
             await update.message.reply_text(
-                f"❌ *Ошибка API*\n\n"
+                f"❌ *Ошибка API*\n"
                 f"📝 {user_message}\n"
-                f"🔢 Код: {error_code}\n\n"
+                f"🔢 Код: {error_code}\n"
                 f"Проверьте ключи в .env файле.",
                 parse_mode='Markdown'
             )
-    
-    async def _check_user_fast(self, update: Update) -> bool:
-        user = update.effective_user
-        username = f"@{user.username}" if user.username else f"ID:{user.id}"
-        if self.authorized_user_id is None:
-            if username == AUTHORIZED_USER:
-                self.authorized_user_id = user.id
-                self.db.set_authorized_user_id(user.id)
-                logger.info(f"Authorized user ID saved: {user.id}")
-                return True
-        elif user.id == self.authorized_user_id:
-            return True
-        await update.message.reply_text("⛔ Доступ запрещен")
-        return False
-    
-    async def _reset_bot_state(self, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data.clear()
-        self.import_waiting = False
     
     def get_main_keyboard(self):
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
@@ -4232,6 +4213,24 @@ class FastDCABot:
     def get_manual_buy_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     
+    async def _check_user_fast(self, update: Update) -> bool:
+        user = update.effective_user
+        username = f"@{user.username}" if user.username else f"ID:{user.id}"
+        if self.authorized_user_id is None:
+            if username == AUTHORIZED_USER:
+                self.authorized_user_id = user.id
+                self.db.set_authorized_user_id(user.id)
+                logger.info(f"Authorized user ID saved: {user.id}")
+                return True
+        elif user.id == self.authorized_user_id:
+            return True
+        await update.message.reply_text("⛔ Доступ запрещен")
+        return False
+    
+    async def _reset_bot_state(self, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data.clear()
+        self.import_waiting = False
+    
     async def _end_conversation_gracefully(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._reset_bot_state(context)
         await update.message.reply_text("Действие отменено", reply_markup=self.get_main_keyboard())
@@ -4271,7 +4270,6 @@ class FastDCABot:
         
         api_status_text = "❌ НЕ РАБОТАЕТ"
         health = None
-        self._init_bybit()  # Всегда инициализируем с свежими ключами
         if self.bybit_initialized:
             health = await self.bybit.check_api_health()
             if health['success']:
@@ -4283,6 +4281,19 @@ class FastDCABot:
                 self._api_was_working = False
                 self.db.set_api_status('error')
                 self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
+        else:
+            self._init_bybit()
+            if self.bybit_initialized:
+                health = await self.bybit.check_api_health()
+                if health['success']:
+                    api_status_text = "✅ РАБОТАЕТ"
+                    self._api_was_working = True
+                    self.db.set_api_status('working')
+                else:
+                    api_status_text = f"❌ {health.get('user_message', 'Ошибка')}"
+                    self._api_was_working = False
+                    self.db.set_api_status('error')
+                    self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
         
         status_emoji = api_status_text.split()[0] if api_status_text.split() else api_status_text
         
