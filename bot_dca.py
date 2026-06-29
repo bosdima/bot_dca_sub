@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.15.0 (28.06.2026)
+Версия 5.15.1 (28.06.2026)
 ИСПРАВЛЕНИЯ:
 - Добавлено динамическое чтение API ключей из .env при каждом обращении
 - Добавлена команда /refresh_api для принудительного обновления ключей
@@ -90,8 +90,8 @@ def get_moscow_time_naive() -> datetime:
     return datetime.now(MOSCOW_TZ).replace(tzinfo=None)
 
 def get_api_keys():
-    """Получает актуальные ключи из .env при каждом вызове"""
-    load_dotenv()
+    """Получает актуальные ключи из .env при каждом вызове (с принудительным перезаписыванием)"""
+    load_dotenv(override=True)  # ✅ override=True — ключ к решению
     api_key = os.getenv('BYBIT_API_KEY')
     api_secret = os.getenv('BYBIT_API_SECRET')
     return api_key, api_secret
@@ -1683,11 +1683,24 @@ class BybitClient:
             self.session = None
     
     def _refresh_session(self):
-        """Принудительно обновляет сессию"""
-        logger.info("Refreshing Bybit session...")
-        self.session = None
-        self._init_session()
-        return self.session is not None
+    """Принудительно обновляет сессию с актуальными ключами из .env"""
+    # Запоминаем старый ключ для сравнения
+    old_key_preview = (self.api_key[:8] + "..." + self.api_key[-4:]) if self.api_key and len(self.api_key) > 12 else (self.api_key or "None")
+    
+    # Перечитываем .env и получаем свежие ключи (внутри _init_session вызывается get_api_keys() с override=True)
+    self.session = None
+    self._init_session()
+    
+    # Запоминаем новый ключ
+    new_key_preview = (self.api_key[:8] + "..." + self.api_key[-4:]) if self.api_key and len(self.api_key) > 12 else (self.api_key or "None")
+    
+    # Логируем результат
+    if old_key_preview != new_key_preview:
+        logger.info(f"🔄 API ключ ИЗМЕНЁН! Старый: {old_key_preview} → Новый: {new_key_preview}")
+    else:
+        logger.info(f"🔄 API ключ не изменился: {new_key_preview}")
+    
+    return self.session is not None
     
     def _is_api_available(self) -> bool:
         """Проверяет, доступен ли API (ключи есть и сессия создана)"""
@@ -4036,14 +4049,10 @@ class FastDCABot:
             await update.message.reply_text(message, parse_mode='Markdown')
     
     async def cmd_refresh_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return
-        
-        await update.message.reply_text("🔄 Обновляю API ключи из .env...")
-        
-        load_dotenv()
-        api_key = os.getenv('BYBIT_API_KEY')
-        api_secret = os.getenv('BYBIT_API_SECRET')
+    ...
+    await update.message.reply_text("🔄 Обновляю API ключи из .env...")
+    load_dotenv(override=True)  # ✅
+    api_key = os.getenv('BYBIT_API_KEY')
         
         if not api_key or not api_secret:
             await update.message.reply_text("❌ Ключи не найдены в .env файле!")
