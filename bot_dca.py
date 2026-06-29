@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.15.1 (28.06.2026)
+Версия 5.15.1 (29.06.2026)
 ИСПРАВЛЕНИЯ:
-- Добавлено динамическое чтение API ключей из .env при каждом обращении
-- Добавлена команда /refresh_api для принудительного обновления ключей
-- Исправлена проблема с кэшированием ключей при их изменении
+- Исправлена ошибка подписи API Bybit (ErrCode: 10004)
+- Исправлена обработка Markdown в Telegram сообщениях
 - Улучшена обработка ошибок API
 """
 
@@ -53,11 +52,11 @@ init(autoreset=True)
 load_dotenv()
 
 # ============ НАСТРОЙКИ ТОКЕНОВ ============
-DEFAULT_SYMBOL = "ETHUSDT"  # Токен по умолчанию
-POPULAR_SYMBOLS = ["ETHUSDT", "XRPUSDT", "BTCUSDT"]  # Список для кнопок
+DEFAULT_SYMBOL = "ETHUSDT"
+POPULAR_SYMBOLS = ["ETHUSDT", "XRPUSDT", "BTCUSDT"]
 # ===========================================
 
-# Настройка логов с ротацией (максимум 200 КБ)
+# Настройка логов с ротацией
 log_handler = RotatingFileHandler("bot_errors.log", encoding='utf-8', maxBytes=200*1024, backupCount=2)
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 
@@ -74,11 +73,9 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.15.0 (28.06.2026)"
+BOT_VERSION = "5.15.1 (29.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
-
-# Фиксированное количество знаков для продажи (используется как запасной вариант)
 SELL_DECIMALS_FALLBACK = 5
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -90,8 +87,7 @@ def get_moscow_time_naive() -> datetime:
     return datetime.now(MOSCOW_TZ).replace(tzinfo=None)
 
 def get_api_keys():
-    """Получает актуальные ключи из .env при каждом вызове (с принудительным перезаписыванием)"""
-    load_dotenv(override=True)  # ✅ override=True — ключ к решению
+    load_dotenv()
     api_key = os.getenv('BYBIT_API_KEY')
     api_secret = os.getenv('BYBIT_API_SECRET')
     return api_key, api_secret
@@ -148,6 +144,20 @@ MAIN_MENU_BUTTONS = [
     "🔙 Назад в меню", "🔙 Назад в настройки", "🔙 Назад к списку", "❌ Отмена"
 ]
 
+async def safe_send_message(bot, chat_id, text, parse_mode=None, reply_markup=None, **kwargs):
+    try:
+        if parse_mode:
+            return await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup, **kwargs)
+        else:
+            return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, **kwargs)
+    except Exception as e:
+        if "Can't parse entities" in str(e) or "Bad Request" in str(e):
+            logger.warning(f"Markdown parse error, sending without formatting: {e}")
+            clean_text = text.replace('*', '').replace('`', '').replace('_', '')
+            return await bot.send_message(chat_id=chat_id, text=clean_text, reply_markup=reply_markup)
+        else:
+            raise e
+
 def format_price(price: float, decimals: int = 4) -> str:
     if price is None: return "N/A"
     return f"{price:.{decimals}f}"
@@ -179,9 +189,6 @@ def calculate_current_drop(current_price: float, avg_price: float) -> float:
     if avg_price <= 0: return 0
     drop = ((avg_price - current_price) / avg_price) * 100
     return max(0, drop)
-
-def get_recommended_purchase_amount(drop_percent: float, base_amount: float, max_amount: float, max_depth: float = MAX_DROP_DEPTH) -> float:
-    return get_amount_by_drop(drop_percent, base_amount, max_amount, max_depth)
 
 def calculate_apy(profit_usdt: float, total_invested: float, days: int) -> float:
     if days <= 0 or total_invested <= 0:
@@ -364,7 +371,6 @@ class Database:
             else:
                 cursor.execute("PRAGMA table_info(executed_orders)")
                 columns = [col[1] for col in cursor.fetchall()]
-                
                 if 'skipped' not in columns:
                     cursor.execute("ALTER TABLE executed_orders ADD COLUMN skipped BOOLEAN DEFAULT 0")
                 if 'notified_at' not in columns:
@@ -1673,7 +1679,7 @@ class BybitClient:
             if api_key and api_secret:
                 self.api_key = api_key
                 self.api_secret = api_secret
-                self.session = HTTP(testnet=self.testnet, api_key=self.api_key, api_secret=self.api_secret, recv_window=5000)
+                self.session = HTTP(testnet=self.testnet, api_key=self.api_key, api_secret=self.api_secret, recv_window=10000)
                 logger.info(f"Bybit session initialized (testnet={self.testnet})")
             else:
                 logger.warning("API key or secret missing")
@@ -1683,33 +1689,17 @@ class BybitClient:
             self.session = None
     
     def _refresh_session(self):
-        """Принудительно обновляет сессию с актуальными ключами из .env"""
-        # Запоминаем старый ключ для сравнения
-        old_key_preview = (self.api_key[:8] + "..." + self.api_key[-4:]) if self.api_key and len(self.api_key) > 12 else (self.api_key or "None")
-    
-       # Перечитываем .env и получаем свежие ключи (внутри _init_session вызывается get_api_keys() с override=True)
-       self.session = None
-       self._init_session()
-    
-       # Запоминаем новый ключ
-       new_key_preview = (self.api_key[:8] + "..." + self.api_key[-4:]) if self.api_key and len(self.api_key) > 12 else (self.api_key or "None")
-    
-       # Логируем результат
-       if old_key_preview != new_key_preview:
-        logger.info(f"🔄 API ключ ИЗМЕНЁН! Старый: {old_key_preview} → Новый: {new_key_preview}")
-       else:
-        logger.info(f"🔄 API ключ не изменился: {new_key_preview}")
-    
-       return self.session is not None
+        logger.info("Refreshing Bybit session...")
+        self.session = None
+        self._init_session()
+        return self.session is not None
     
     def _is_api_available(self) -> bool:
-        """Проверяет, доступен ли API (ключи есть и сессия создана)"""
         if not self.session:
             self._refresh_session()
         return self.session is not None and self.api_key and self.api_secret
     
     async def check_api_health(self) -> Dict:
-        """Проверяет работоспособность API ключа"""
         self._refresh_session()
         
         if not self._is_api_available():
@@ -1741,7 +1731,7 @@ class BybitClient:
                 
                 error_descriptions = {
                     10003: 'API ключ не найден',
-                    10004: 'API ключ истек (expired) или неверный',
+                    10004: 'API ключ истек (expired) или неверный (проверьте секретный ключ)',
                     10005: 'Неверный API ключ или секрет',
                     10006: 'Недостаточно прав для этого действия',
                     10010: 'IP-адрес не в белом списке',
@@ -2257,11 +2247,8 @@ class DCAStrategy:
             f"✅ Ордер активен!"
         )
         
-        try:
-            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
-            logger.info(f"Sell order notification sent")
-        except Exception as e:
-            logger.error(f"Error sending notification: {e}")
+        await safe_send_message(bot, user_id, message, parse_mode='Markdown')
+        logger.info(f"Sell order notification sent")
     
     async def _send_no_sell_order_notification(self, symbol: str, reason: str, bot):
         user_id = self.db.get_authorized_user_id()
@@ -2275,11 +2262,8 @@ class DCAStrategy:
             f"🔄 Проверка будет выполнена через 1 час."
         )
         
-        try:
-            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
-            logger.info(f"No sell order notification sent")
-        except Exception as e:
-            logger.error(f"Error sending notification: {e}")
+        await safe_send_message(bot, user_id, message, parse_mode='Markdown')
+        logger.info(f"No sell order notification sent")
     
     async def _send_sell_order_removed_notification(self, symbol: str, bot):
         user_id = self.db.get_authorized_user_id()
@@ -2294,11 +2278,8 @@ class DCAStrategy:
             f"✅ Новый ордер будет создан с +5% прибыли."
         )
         
-        try:
-            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
-            logger.info(f"Sell order removed notification sent")
-        except Exception as e:
-            logger.error(f"Error sending notification: {e}")
+        await safe_send_message(bot, user_id, message, parse_mode='Markdown')
+        logger.info(f"Sell order removed notification sent")
     
     async def _send_purchase_skipped_notification(self, symbol: str, reason: str, current_price: float, avg_price: float, bot):
         user_id = self.db.get_authorized_user_id()
@@ -2314,11 +2295,8 @@ class DCAStrategy:
             f"🔄 Следующая проверка по расписанию."
         )
         
-        try:
-            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
-            logger.info(f"Purchase skipped notification sent: {reason}")
-        except Exception as e:
-            logger.error(f"Error sending purchase skipped notification: {e}")
+        await safe_send_message(bot, user_id, message, parse_mode='Markdown')
+        logger.info(f"Purchase skipped notification sent: {reason}")
     
     async def check_and_create_sell_order(self, symbol: str, bot, silent: bool = False) -> Dict:
         try:
@@ -2345,7 +2323,6 @@ class DCAStrategy:
                 return {'success': False, 'error': error_msg}
             
             actual_balance = balance_info.get('equity', 0)
-            
             logger.info(f"Balance {coin}: available={balance_info.get('available', 0)}, equity={actual_balance}")
             
             if actual_balance <= 0:
@@ -2737,11 +2714,8 @@ class DCAStrategy:
             f"✅ Ордер сохранен и будет автоматически восстановлен."
         )
         
-        try:
-            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
-            logger.info(f"Failed sell notification sent")
-        except Exception as e:
-            logger.error(f"Error sending failed sell notification: {e}")
+        await safe_send_message(bot, user_id, message, parse_mode='Markdown')
+        logger.info(f"Failed sell notification sent")
     
     async def _send_pending_sell_notification(self, symbol: str, quantity: float, target_price: float, profit_percent: float, reason: str, bot):
         user_id = self.db.get_authorized_user_id()
@@ -2760,11 +2734,8 @@ class DCAStrategy:
             f"✅ Ордер сохранен и будет автоматически выставлен при возможности."
         )
         
-        try:
-            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
-            logger.info(f"Pending sell notification sent")
-        except Exception as e:
-            logger.error(f"Error sending pending sell notification: {e}")
+        await safe_send_message(bot, user_id, message, parse_mode='Markdown')
+        logger.info(f"Pending sell notification sent")
     
     async def execute_scheduled_purchase(self, symbol: str, profit_percent: float, bot) -> Dict:
         if not self.bybit._is_api_available():
@@ -2923,7 +2894,6 @@ class DCAStrategy:
         
         return result
     
-    # Продолжение DCAStrategy...
     async def execute_ladder_purchase(self, symbol: str, profit_percent: float, bot) -> Dict:
         current_price = await self.bybit.get_symbol_price(symbol)
         if not current_price:
@@ -3103,11 +3073,8 @@ class DCAStrategy:
                            f"💰 Цена продажи: `{format_price(rounded_price, 4)}` USDT\n"
                            f"📈 Целевая прибыль: `{order['profit_percent']}%`\n\n"
                            f"✅ Ордер успешно выставлен!")
-                    try:
-                        await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
-                        logger.info(f"Sent pending order notification for {symbol} to user {user_id}")
-                    except Exception as e:
-                        logger.error(f"Error sending pending order notification: {e}")
+                    await safe_send_message(bot, user_id, msg, parse_mode='Markdown')
+                    logger.info(f"Sent pending order notification for {symbol} to user {user_id}")
                 elif sell_result.get('pending'):
                     fail_reason = sell_result.get('reason', 'Неизвестная причина')
                     self.db.update_pending_sell_retry(order['id'], fail_reason)
@@ -3282,12 +3249,9 @@ class DCAStrategy:
                 [InlineKeyboardButton("✅ Да, очистить статистику сейчас", callback_data=f"confirm_clear_stats_{symbol}_{sell['id']}"),
                  InlineKeyboardButton("❌ Нет, оставить", callback_data=f"skip_clear_stats_{symbol}_{sell['id']}")]
             ])
-            try:
-                await bot.send_message(chat_id=user_id, text=message, parse_mode='HTML', reply_markup=keyboard)
-                logger.info(f"Sent completed sell notification for {symbol} to user {user_id}")
-                self.db.mark_completed_sell_notified(sell['id'])
-            except Exception as e:
-                logger.error(f"Error sending notification: {e}")
+            await safe_send_message(bot, user_id, message, parse_mode='HTML', reply_markup=keyboard)
+            logger.info(f"Sent completed sell notification for {symbol} to user {user_id}")
+            self.db.mark_completed_sell_notified(sell['id'])
         
         return our_completed
     
@@ -3314,18 +3278,12 @@ class DCAStrategy:
                 self.db.log_action('AUTO_STATS_CLEARED', sym, f"Автоматическая очистка после дедлайна, удалено {deleted_count} покупок")
                 self.db.mark_completed_sell_stats_cleared(sell_id)
                 
-                try:
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text=f"🔄 *Автоматическая очистка статистики*\n\n"
-                             f"🪙 Токен: `{sym}`\n"
-                             f"🗑 Удалено покупок: `{deleted_count}`\n\n"
-                             f"📊 Начинаем новый цикл накопления.",
-                        parse_mode='Markdown'
-                    )
-                    logger.info(f"Auto cleared stats for {sym}")
-                except Exception as e:
-                    logger.error(f"Error sending auto-clear notification: {e}")
+                msg = (f"🔄 *Автоматическая очистка статистики*\n\n"
+                       f"🪙 Токен: `{sym}`\n"
+                       f"🗑 Удалено покупок: `{deleted_count}`\n\n"
+                       f"📊 Начинаем новый цикл накопления.")
+                await safe_send_message(bot, user_id, msg, parse_mode='Markdown')
+                logger.info(f"Auto cleared stats for {sym}")
     
     async def get_recommended_purchase(self, symbol: str) -> Dict:
         current_price = await self.bybit.get_symbol_price(symbol)
@@ -3427,14 +3385,9 @@ class DCAStrategy:
                 InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
                 InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
             ]])
-            try:
-                if user_id:
-                    await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
-                    logger.info(f"Sent order notification for {order['order_id']} to user {user_id}")
-                else:
-                    logger.error(f"Cannot send notification: user_id is None")
-            except Exception as e:
-                logger.error(f"Error sending notification: {e}")
+            if user_id:
+                await safe_send_message(bot, user_id, msg, parse_mode='Markdown', reply_markup=keyboard)
+                logger.info(f"Sent order notification for {order['order_id']} to user {user_id}")
         
         return new_orders
     
@@ -3503,14 +3456,9 @@ class DCAStrategy:
                 InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
                 InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
             ]])
-            try:
-                if user_id:
-                    await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
-                    logger.info(f"Sent full-check order notification for {order['order_id']} to user {user_id}")
-                else:
-                    logger.error("Cannot send full-check notification: user_id is None")
-            except Exception as e:
-                logger.error(f"Error sending notification: {e}")
+            if user_id:
+                await safe_send_message(bot, user_id, msg, parse_mode='Markdown', reply_markup=keyboard)
+                logger.info(f"Sent full-check order notification for {order['order_id']} to user {user_id}")
         
         self.db.set_last_full_check_time(get_moscow_time_naive())
         return missing_orders
@@ -3903,7 +3851,7 @@ class FastDCABot:
             self.bybit = BybitClient(api_key, api_secret, testnet)
             self.strategy = DCAStrategy(self.db, self.bybit)
             self.bybit_initialized = True
-            logger.info(f"Bybit client initialized (demo={testnet})")
+            logger.info(f"Bybit client initialized with fresh keys (demo={testnet})")
         except Exception as e:
             logger.error(f"Bybit init error: {e}")
             self.bybit_initialized = False
@@ -3935,20 +3883,12 @@ class FastDCABot:
                 
                 if user_id and not is_startup:
                     message = (
-                        f"✅ *Бот запущен и готов к работе!*\n"
-                        f"🌐 Доступ к бирже Bybit по API ключу работает\n\n"
-                        f"🔄 API ключ восстановлен и работает корректно.\n"
-                        f"🕐 Время проверки: `{get_moscow_time().strftime('%H:%M:%S')}`"
-                    )
-                    try:
-                        await self.application.bot.send_message(
-                            chat_id=user_id,
-                            text=message,
-                            parse_mode='Markdown'
-                        )
-                        logger.info("API recovery notification sent")
-                    except Exception as e:
-                        logger.error(f"Error sending API recovery notification: {e}")
+                        "✅ *API Bybit восстановлен!*\n\n"
+                        "🔑 Ключи работают корректно.\n"
+                        "🕐 Время проверки: `{}`"
+                    ).format(get_moscow_time().strftime('%H:%M:%S'))
+                    await safe_send_message(self.application.bot, user_id, message, parse_mode='Markdown')
+                    logger.info("API recovery notification sent")
             return True
         else:
             self._api_was_working = False
@@ -3956,57 +3896,25 @@ class FastDCABot:
             self.db.set_api_status('error')
             self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
             
-            if user_id:
-                if is_startup or self._api_error_count % 3 == 0:
-                    error_code = health.get('error_code', 'N/A')
-                    user_message = health.get('user_message', 'Неизвестная ошибка')
-                    
-                    message = (
-                        f"🚨 *КРИТИЧЕСКАЯ ОШИБКА API BYBIT!*\n\n"
-                        f"❌ Статус: `НЕ РАБОТАЕТ`\n"
-                        f"📝 Ошибка: `{user_message}`\n"
-                        f"🔢 Код: `{error_code}`\n\n"
-                        f"⚠️ *Что делать:*\n"
-                        f"1️⃣ Проверьте API ключ в файле `.env`\n"
-                        f"2️⃣ Убедитесь, что ключ активен (выдается на 90 дней)\n"
-                        f"3️⃣ Проверьте права доступа (нужны: spot trade, wallet read)\n"
-                        f"4️⃣ Проверьте IP в белом списке Bybit\n\n"
-                        f"🔄 Бот будет проверять доступ каждые 6 часов.\n"
-                        f"📋 Следующая проверка: через 6 часов."
-                    )
-                    try:
-                        await self.application.bot.send_message(
-                            chat_id=user_id,
-                            text=message,
-                            parse_mode='Markdown'
-                        )
-                        logger.info(f"API error notification sent (attempt {self._api_error_count})")
-                    except Exception as e:
-                        logger.error(f"Error sending API error notification: {e}")
+            if user_id and (is_startup or self._api_error_count % 3 == 0):
+                error_code = health.get('error_code', 'N/A')
+                user_message = health.get('user_message', 'Неизвестная ошибка')
+                
+                message = (
+                    "🚨 *ОШИБКА API BYBIT!*\n\n"
+                    "❌ Статус: НЕ РАБОТАЕТ\n"
+                    "📝 Ошибка: {}\n"
+                    "🔢 Код: {}\n\n"
+                    "⚠️ *Что делать:*\n"
+                    "1️⃣ Проверьте API ключ в файле `.env`\n"
+                    "2️⃣ Убедитесь, что ключ активен\n"
+                    "3️⃣ Проверьте права доступа\n"
+                    "4️⃣ Проверьте IP в белом списке Bybit\n\n"
+                    "🔄 Бот будет проверять доступ каждые 6 часов."
+                ).format(user_message, error_code)
+                await safe_send_message(self.application.bot, user_id, message, parse_mode='Markdown')
+                logger.info(f"API error notification sent (attempt {self._api_error_count})")
             return False
-    
-    async def api_check_loop(self):
-        logger.info("API check loop started (every 6 hours)")
-        
-        await asyncio.sleep(60)
-        
-        while self.scheduler_running:
-            try:
-                if self.bybit_initialized:
-                    await self.check_api_and_notify(is_startup=False)
-                else:
-                    self._init_bybit()
-                    if self.bybit_initialized:
-                        await self.check_api_and_notify(is_startup=False)
-                
-                await asyncio.sleep(6 * 3600)
-                
-            except asyncio.CancelledError:
-                logger.info("API check loop cancelled")
-                break
-            except Exception as e:
-                logger.error(f"API check loop error: {e}")
-                await asyncio.sleep(300)
     
     async def cmd_check_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -4015,6 +3923,7 @@ class FastDCABot:
         await update.message.reply_text("🔍 Проверяю API ключ...")
         
         self.refresh_api_session()
+        
         if not self.bybit_initialized:
             await update.message.reply_text("❌ API не инициализирован. Проверьте .env файл.")
             return
@@ -4025,65 +3934,91 @@ class FastDCABot:
             self._api_was_working = True
             self.db.set_api_status('working')
             self.db.set_api_error_message('')
-            await update.message.reply_text(
+            message = (
                 "✅ *API Bybit работает корректно!*\n\n"
                 "🔑 Ключ активен и имеет необходимые права.\n"
-                f"🕐 Время проверки: `{get_moscow_time().strftime('%H:%M:%S')}`",
-                parse_mode='Markdown'
-            )
+                "🕐 Время проверки: `{}`"
+            ).format(get_moscow_time().strftime('%H:%M:%S'))
+            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
         else:
             error_code = health.get('error_code', 'N/A')
             user_message = health.get('user_message', 'Неизвестная ошибка')
             
             message = (
-                f"🚨 *КРИТИЧЕСКАЯ ОШИБКА API BYBIT!*\n\n"
-                f"❌ Статус: `НЕ РАБОТАЕТ`\n"
-                f"📝 Ошибка: `{user_message}`\n"
-                f"🔢 Код: `{error_code}`\n\n"
-                f"⚠️ *Что делать:*\n"
-                f"1️⃣ Проверьте API ключ в файле `.env`\n"
-                f"2️⃣ Убедитесь, что ключ активен (выдается на 90 дней)\n"
-                f"3️⃣ Проверьте права доступа (нужны: spot trade, wallet read)\n"
-                f"4️⃣ Проверьте IP в белом списке Bybit"
-            )
-            await update.message.reply_text(message, parse_mode='Markdown')
-
+                "🚨 *КРИТИЧЕСКАЯ ОШИБКА API BYBIT!*\n\n"
+                "❌ Статус: `НЕ РАБОТАЕТ`\n"
+                "📝 Ошибка: `{}`\n"
+                "🔢 Код: `{}`\n\n"
+                "⚠️ *Что делать:*\n"
+                "1️⃣ Проверьте API ключ в файле `.env`\n"
+                "2️⃣ Убедитесь, что ключ активен (выдается на 90 дней)\n"
+                "3️⃣ Проверьте права доступа (нужны: spot trade, wallet read)\n"
+                "4️⃣ Проверьте IP в белом списке Bybit"
+            ).format(user_message, error_code)
+            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
+    
     async def cmd_refresh_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
+        
         await update.message.reply_text("🔄 Обновляю API ключи из .env...")
-        load_dotenv(override=True)
+        
+        load_dotenv()
         api_key = os.getenv('BYBIT_API_KEY')
         api_secret = os.getenv('BYBIT_API_SECRET')
+        
         if not api_key or not api_secret:
             await update.message.reply_text("❌ Ключи не найдены в .env файле!")
             return
+        
         await update.message.reply_text(f"✅ Ключи найдены:\nAPI Key: {api_key[:8]}...{api_key[-4:]}")
+        
         self.refresh_api_session()
+        
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Не удалось создать сессию Bybit")
             return
+        
         await update.message.reply_text("🔍 Проверяю работоспособность ключей...")
         health = await self.bybit.check_api_health()
+        
         if health['success']:
             self._api_was_working = True
             self.db.set_api_status('working')
             self.db.set_api_error_message('')
             await update.message.reply_text(
-                "✅ *API Bybit работает корректно!*\n"
+                "✅ *API Bybit работает корректно!*\n\n"
                 "🔑 Ключи актуальны и имеют необходимые права.",
                 parse_mode='Markdown'
             )
         else:
             error_code = health.get('error_code', 'N/A')
             user_message = health.get('user_message', 'Неизвестная ошибка')
-            await update.message.reply_text(
-                f"❌ *Ошибка API*\n"
-                f"📝 {user_message}\n"
-                f"🔢 Код: {error_code}\n"
-                f"Проверьте ключи в .env файле.",
-                parse_mode='Markdown'
-            )
+            message = (
+                "❌ *Ошибка API*\n\n"
+                "📝 {}\n"
+                "🔢 Код: {}\n\n"
+                "Проверьте ключи в .env файле."
+            ).format(user_message, error_code)
+            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
+    
+    async def _check_user_fast(self, update: Update) -> bool:
+        user = update.effective_user
+        username = f"@{user.username}" if user.username else f"ID:{user.id}"
+        if self.authorized_user_id is None:
+            if username == AUTHORIZED_USER:
+                self.authorized_user_id = user.id
+                self.db.set_authorized_user_id(user.id)
+                logger.info(f"Authorized user ID saved: {user.id}")
+                return True
+        elif user.id == self.authorized_user_id:
+            return True
+        await update.message.reply_text("⛔ Доступ запрещен")
+        return False
+    
+    async def _reset_bot_state(self, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data.clear()
+        self.import_waiting = False
     
     def get_main_keyboard(self):
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
@@ -4192,12 +4127,6 @@ class FastDCABot:
     def get_confirm_delete_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("✅ Да, удалить"), KeyboardButton("❌ Нет, отмена")]], resize_keyboard=True)
     
-    def get_clear_stats_keyboard(self):
-        return ReplyKeyboardMarkup([
-            [KeyboardButton("✅ Да, очистить статистику")],
-            [KeyboardButton("❌ Нет, оставить")]
-        ], resize_keyboard=True)
-    
     def get_purchases_list_keyboard(self, purchases):
         keyboard = []
         for p in purchases:
@@ -4212,24 +4141,6 @@ class FastDCABot:
     
     def get_manual_buy_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-    
-    async def _check_user_fast(self, update: Update) -> bool:
-        user = update.effective_user
-        username = f"@{user.username}" if user.username else f"ID:{user.id}"
-        if self.authorized_user_id is None:
-            if username == AUTHORIZED_USER:
-                self.authorized_user_id = user.id
-                self.db.set_authorized_user_id(user.id)
-                logger.info(f"Authorized user ID saved: {user.id}")
-                return True
-        elif user.id == self.authorized_user_id:
-            return True
-        await update.message.reply_text("⛔ Доступ запрещен")
-        return False
-    
-    async def _reset_bot_state(self, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data.clear()
-        self.import_waiting = False
     
     async def _end_conversation_gracefully(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._reset_bot_state(context)
@@ -4270,6 +4181,7 @@ class FastDCABot:
         
         api_status_text = "❌ НЕ РАБОТАЕТ"
         health = None
+        self._init_bybit()
         if self.bybit_initialized:
             health = await self.bybit.check_api_health()
             if health['success']:
@@ -4281,19 +4193,6 @@ class FastDCABot:
                 self._api_was_working = False
                 self.db.set_api_status('error')
                 self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
-        else:
-            self._init_bybit()
-            if self.bybit_initialized:
-                health = await self.bybit.check_api_health()
-                if health['success']:
-                    api_status_text = "✅ РАБОТАЕТ"
-                    self._api_was_working = True
-                    self.db.set_api_status('working')
-                else:
-                    api_status_text = f"❌ {health.get('user_message', 'Ошибка')}"
-                    self._api_was_working = False
-                    self.db.set_api_status('error')
-                    self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
         
         status_emoji = api_status_text.split()[0] if api_status_text.split() else api_status_text
         
@@ -4310,18 +4209,7 @@ class FastDCABot:
             f"🔄 Проверка API выполняется каждые 6 часов."
         )
         
-        try:
-            await update.message.reply_text(
-                start_message,
-                reply_markup=self.get_main_keyboard(),
-                parse_mode='Markdown'
-            )
-        except Exception as e:
-            logger.error(f"Error sending start message: {e}")
-            await update.message.reply_text(
-                start_message.replace('*', '').replace('`', ''),
-                reply_markup=self.get_main_keyboard()
-            )
+        await safe_send_message(self.application.bot, update.effective_user.id, start_message, parse_mode='Markdown', reply_markup=self.get_main_keyboard())
         
         if self.bybit_initialized and health and not health['success']:
             await self.check_api_and_notify(is_startup=True)
@@ -4833,12 +4721,9 @@ class FastDCABot:
                 InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
                 InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
             ]])
-            try:
-                await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg_text, parse_mode='Markdown', reply_markup=keyboard)
-                notified_count += 1
-                await asyncio.sleep(0.3)
-            except Exception as e:
-                logger.error(f"Error sending notification: {e}")
+            await safe_send_message(self.application.bot, self.authorized_user_id, msg_text, parse_mode='Markdown', reply_markup=keyboard)
+            notified_count += 1
+            await asyncio.sleep(0.3)
         
         for sell in sell_result['missing']:
             profit_emoji = "🟢" if sell['profit_usdt'] >= 0 else "🔴"
@@ -4858,11 +4743,8 @@ class FastDCABot:
                 InlineKeyboardButton("✅ Да, очистить", callback_data=f"confirm_clear_stats_{symbol}_{sell['id']}"),
                 InlineKeyboardButton("❌ Нет, оставить", callback_data=f"skip_clear_stats_{symbol}_{sell['id']}")
             ]])
-            try:
-                await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg_text, parse_mode='Markdown', reply_markup=keyboard)
-                await asyncio.sleep(0.3)
-            except Exception as e:
-                logger.error(f"Error sending notification: {e}")
+            await safe_send_message(self.application.bot, self.authorized_user_id, msg_text, parse_mode='Markdown', reply_markup=keyboard)
+            await asyncio.sleep(0.3)
         
         if notified_count == 0 and not sell_result['missing']:
             await self.application.bot.send_message(chat_id=self.authorized_user_id, text="✨ *Отлично!* Все ордера синхронизированы.", parse_mode='Markdown')
@@ -5204,7 +5086,7 @@ class FastDCABot:
         stats = self.db.get_dca_stats(symbol)
         if stats:
             message += f"\n📊 Всего покупок: `{stats['total_purchases']}`\n💰 Вложено: `{stats['total_usdt']:.2f}` USDT"
-        await update.message.reply_text(message, parse_mode='Markdown')
+        await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
     
     async def toggle_dca(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -6024,22 +5906,17 @@ class FastDCABot:
                                 msg += f"📊 Ордер на продажу: `{format_quantity(result['sell_quantity'], 5)}` {symbol.replace('USDT', '')}\n"
                             if result.get('sell_warning'):
                                 msg += f"\n⚠️ {result['sell_warning']}"
-                            try:
-                                await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
-                            except:
-                                pass
+                            await safe_send_message(self.application.bot, self.authorized_user_id, msg, parse_mode='Markdown')
                     elif result.get('error') == 'skip_price_above_avg':
                         pass
                     else:
                         if self.authorized_user_id:
-                            try:
-                                await self.application.bot.send_message(
-                                    chat_id=self.authorized_user_id,
-                                    text=f"❌ *Ошибка авто DCA*\n\n{result.get('error')}",
-                                    parse_mode='Markdown'
-                                )
-                            except:
-                                pass
+                            await safe_send_message(
+                                self.application.bot,
+                                self.authorized_user_id,
+                                f"❌ *Ошибка авто DCA*\n\n{result.get('error')}",
+                                parse_mode='Markdown'
+                            )
                     
                     frequency_hours = int(self.db.get_setting('frequency_hours', '24'))
                     next_time = next_time + timedelta(hours=frequency_hours)
@@ -6200,12 +6077,9 @@ class FastDCABot:
                         
                         msg += f"💡 *Сумма для ручного ордера:* `{manual_amount:.2f}` USDT"
                         
-                        try:
-                            await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
-                            self.db.set_last_purchase_notify_date(current_date_str)
-                            logger.info(f"Sent daily purchase notification at {notify_time_str} MSK")
-                        except Exception as e:
-                            logger.error(f"Error sending purchase notification: {e}")
+                        await safe_send_message(self.application.bot, self.authorized_user_id, msg, parse_mode='Markdown')
+                        self.db.set_last_purchase_notify_date(current_date_str)
+                        logger.info(f"Sent daily purchase notification at {notify_time_str} MSK")
                 
             except asyncio.CancelledError:
                 logger.info("Purchase notify loop cancelled")
@@ -6479,6 +6353,31 @@ class FastDCABot:
             await asyncio.gather(*self.background_tasks, return_exceptions=True)
         
         logger.info("Bot shutdown complete")
+    
+    async def api_check_loop(self):
+        logger.info("API check loop started (every 6 hours)")
+        
+        await asyncio.sleep(60)
+        
+        while self.scheduler_running:
+            try:
+                self.refresh_api_session()
+                
+                if self.bybit_initialized:
+                    await self.check_api_and_notify(is_startup=False)
+                else:
+                    self._init_bybit()
+                    if self.bybit_initialized:
+                        await self.check_api_and_notify(is_startup=False)
+                
+                await asyncio.sleep(6 * 3600)
+                
+            except asyncio.CancelledError:
+                logger.info("API check loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"API check loop error: {e}")
+                await asyncio.sleep(300)
     
     def setup_handlers(self):
         logger.info("Setting up handlers...")
