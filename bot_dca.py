@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.20.0 (05.07.2026)
+Версия 5.21.0 (05.07.2026)
 ИСПРАВЛЕНИЯ:
-- Исправлена логика поиска ордеров: поиск с даты последней продажи или первого ордера
-- Добавлен сброс статуса executed_orders при удалении покупки
-- Исправлено округление количества для продажи
-- Оптимизирована работа фоновых задач
+- Добавлена поддержка суб-аккаунтов Bybit
+- Убран Demo режим, добавлен режим "Суб-аккаунт"
+- Исправлена ошибка 10024 при торговле на суб-аккаунте
+- Обновлен интерфейс настроек
 """
 
 import os
@@ -72,7 +72,7 @@ LADDER_MAX_DEPTH = 80
 
 # --- 4. Настройки торговли ---
 PROFIT_PERCENT = 5
-TRADING_MODE = "real"
+TRADING_MODE = "real"  # real или sub_account
 MANUAL_AMOUNT = 1.1
 
 # --- 5. Настройки уведомлений о покупке ---
@@ -110,7 +110,7 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.20.0 (05.07.2026)"
+BOT_VERSION = "5.21.0 (05.07.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 SELL_DECIMALS_FALLBACK = 5
@@ -498,8 +498,8 @@ class Database:
     def set_trading_mode(self, mode: str):
         self.set_setting('trading_mode', mode)
     
-    def is_demo_mode(self) -> bool:
-        return self.get_trading_mode() == 'demo'
+    def is_sub_account_mode(self) -> bool:
+        return self.get_trading_mode() == 'sub_account'
     
     def get_first_order_date(self) -> Optional[datetime]:
         date_str = self.get_setting('first_order_date', '')
@@ -651,7 +651,6 @@ class Database:
             conn.commit()
             conn.close()
             if success and purchase:
-                # ИСПРАВЛЕНИЕ: Сбрасываем статус в executed_orders
                 self.reset_executed_order_status(purchase['price'], purchase['quantity'], purchase['symbol'], purchase.get('order_id'))
             if success:
                 self.update_first_order_date()
@@ -665,14 +664,12 @@ class Database:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
             if order_id:
-                # Сбрасываем по order_id
                 cursor.execute('''
                     UPDATE executed_orders 
                     SET added_to_stats = 0, skipped = 0, notified_at = NULL 
                     WHERE order_id = ?
                 ''', (order_id,))
             else:
-                # Сбрасываем по цене и количеству (старый метод)
                 cursor.execute('''
                     UPDATE executed_orders 
                     SET added_to_stats = 0, skipped = 0, notified_at = NULL 
@@ -855,7 +852,8 @@ class Database:
             return sell_id
         except Exception as e:
             logger.error(f"Error adding completed sell: {e}")
-            return 0    
+            return 0
+    
     def mark_completed_sell_notified(self, sell_id: int):
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -1760,6 +1758,11 @@ class BybitClient:
             self._refresh_session()
         return self.session is not None and self.api_key and self.api_secret
     
+    def _get_headers(self) -> Dict:
+        """Возвращает заголовки для запросов (заглушка для суб-аккаунта)"""
+        # pybit сам добавляет заголовки, нам не нужно добавлять дополнительные
+        return {}
+    
     async def check_api_health(self) -> Dict:
         self._refresh_session()
         
@@ -1797,6 +1800,7 @@ class BybitClient:
                     10006: 'Недостаточно прав для этого действия',
                     10010: 'IP-адрес не в белом списке',
                     10016: 'Превышен лимит запросов',
+                    10024: 'Доступ к продукту ограничен для этого аккаунта. Попробуйте переключить режим на "Суб-аккаунт"'
                 }
                 
                 user_message = error_descriptions.get(error_code, error_msg)
@@ -1806,7 +1810,7 @@ class BybitClient:
                     'error': error_msg,
                     'error_code': error_code,
                     'user_message': user_message,
-                    'is_api_error': error_code in [10003, 10004, 10005, 10006, 10010, 10016]
+                    'is_api_error': error_code in [10003, 10004, 10005, 10006, 10010, 10016, 10024]
                 }
                 
         except Exception as e:
@@ -2204,6 +2208,10 @@ class BybitClient:
                         rounded_quantity = test_rounded
                         break
             
+            if rounded_quantity < min_qty and quantity >= min_qty * 0.99:
+                rounded_quantity = min_qty
+                logger.info(f"Скорректировано количество для продажи до минимального: {rounded_quantity}")
+            
             if rounded_quantity < min_qty:
                 return {'success': False, 'error': f'Минимальное количество: {min_qty} {symbol.replace("USDT", "")}'}
             
@@ -2234,6 +2242,9 @@ class BybitClient:
                         logger.info(f"Retrying with quantity: {retry_quantity} (decimals={decimals})")
                         return await self.place_limit_sell(symbol, retry_quantity, price)
                 return {'success': False, 'error': 'quantity_decimals_error', 'message': response['retMsg'], 'quantity': rounded_quantity}
+            # Обработка ошибки 10024
+            if response['retCode'] == 10024:
+                return {'success': False, 'error': f'Ошибка доступа: {response["retMsg"]}. Попробуйте включить режим "Суб-аккаунт" в настройках'}
             return {'success': False, 'error': f"{response['retMsg']} (Код: {response['retCode']})"}
         except Exception as e:
             logger.error(f"Error placing sell order: {e}")
@@ -2293,6 +2304,9 @@ class BybitClient:
                 return {'success': True, 'order_id': response['result']['orderId'], 'quantity': float(rounded_quantity), 'price': rounded_price, 'total_usdt': order_value}
             if response['retCode'] == 170131:
                 return {'success': False, 'error': 'insufficient_balance', 'message': response['retMsg']}
+            # Обработка ошибки 10024
+            if response['retCode'] == 10024:
+                return {'success': False, 'error': f'Ошибка доступа: {response["retMsg"]}. Попробуйте включить режим "Суб-аккаунт" в настройках'}
             return {'success': False, 'error': response['retMsg'], 'code': response['retCode']}
         except Exception as e:
             logger.error(f"Error placing buy order: {e}")
@@ -2432,7 +2446,8 @@ class DCAStrategy:
             
             rounded_price = self.bybit._round_price_by_tick(target_price, tick_size)
             if rounded_price <= 0:
-                rounded_price = tick_size            
+                rounded_price = tick_size
+            
             sell_quantity = self.bybit._round_quantity_for_sell(actual_balance, qty_decimals)
             
             if sell_quantity < min_qty and actual_balance >= min_qty:
@@ -3319,7 +3334,6 @@ class DCAStrategy:
         return message
     
     async def check_completed_sells(self, symbol: str, user_id: int, bot, force: bool = False) -> List[Dict]:
-        # ИСПРАВЛЕНИЕ: Определяем дату проверки с учетом последней продажи
         last_sell_date = self.db.get_last_sell_order_date()
         first_order_date = self.db.get_first_order_date()
         
@@ -3396,7 +3410,6 @@ class DCAStrategy:
                 deadline = deadline + timedelta(days=1)
             self.db.set_clear_deadline(sell_id, deadline)
             
-            # Сохраняем дату последней продажи
             if sell.get('executed_at'):
                 self.db.set_last_sell_order_date(sell['executed_at'])
                 logger.info(f"Updated last sell order date: {sell['executed_at']}")
@@ -3500,13 +3513,11 @@ class DCAStrategy:
         }
     
     async def check_new_orders_incremental(self, symbol: str, user_id: int, bot) -> List[Dict]:
-        # ИСПРАВЛЕНИЕ: Определяем дату проверки с учетом последней продажи ИЛИ первого ордера
         last_check = self.db.get_last_incremental_check_time()
         last_sell_date = self.db.get_last_sell_order_date()
         first_order_date = self.db.get_first_order_date()
         
         if last_check is None:
-            # Используем дату последней продажи или первого ордера
             if last_sell_date is not None:
                 check_date = last_sell_date - timedelta(seconds=1)
                 logger.info(f"Incremental check from last sell date: {check_date}")
@@ -3517,13 +3528,10 @@ class DCAStrategy:
                 check_date = get_moscow_time_naive() - timedelta(days=1)
                 logger.info(f"Incremental check from last 1 day: {check_date}")
         else:
-            # Используем дату последней проверки
             check_date = last_check
             logger.info(f"Incremental check from last check: {check_date}")
         
         all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
-        
-        # Сохраняем время проверки
         self.db.set_last_incremental_check_time(get_moscow_time_naive())
         
         purchases = self.db.get_purchases(symbol)
@@ -3585,13 +3593,11 @@ class DCAStrategy:
         return new_orders
     
     async def full_check_missing_orders(self, symbol: str, user_id: int, bot) -> List[Dict]:
-        # ИСПРАВЛЕНИЕ: Определяем дату проверки с учетом последней продажи ИЛИ первого ордера
         last_sell_date = self.db.get_last_sell_order_date()
         first_order_date = self.db.get_first_order_date()
         last_full_check = self.db.get_last_full_check_time()
         
         if last_full_check is not None and last_sell_date is not None:
-            # Используем более позднюю дату
             check_date = max(last_full_check, last_sell_date) - timedelta(seconds=1)
             logger.info(f"Full check from max date: {check_date}")
         elif last_sell_date is not None:
@@ -3692,7 +3698,6 @@ class DCAStrategy:
             return {'type': 'incremental', 'count': len(new_orders), 'orders': new_orders}
     
     async def force_check_executed_orders(self, symbol: str, bot, user_id: int) -> Dict:
-        # ИСПРАВЛЕНИЕ: Определяем дату проверки с учетом последней продажи ИЛИ первого ордера
         last_sell_date = self.db.get_last_sell_order_date()
         first_order_date = self.db.get_first_order_date()
         
@@ -3760,7 +3765,6 @@ class DCAStrategy:
         }
     
     async def force_check_completed_sells(self, symbol: str, bot, user_id: int) -> Dict:
-        # ИСПРАВЛЕНИЕ: Определяем дату проверки с учетом последней продажи
         last_sell_date = self.db.get_last_sell_order_date()
         first_order_date = self.db.get_first_order_date()
         
@@ -4082,7 +4086,9 @@ class FastDCABot:
             self.bybit = BybitClient(api_key, api_secret, testnet)
             self.strategy = DCAStrategy(self.db, self.bybit)
             self.bybit_initialized = True
-            logger.info(f"Bybit client initialized with fresh keys (demo={testnet})")
+            mode = self.db.get_trading_mode()
+            mode_text = "Суб-аккаунт" if mode == 'sub_account' else "Обычный"
+            logger.info(f"Bybit client initialized with fresh keys (mode={mode_text})")
         except Exception as e:
             logger.error(f"Bybit init error: {e}")
             self.bybit_initialized = False
@@ -4093,163 +4099,6 @@ class FastDCABot:
         self.bybit = None
         self._init_bybit(force_reload=True)
         return self.bybit_initialized
-    
-    async def check_api_and_notify(self, is_startup: bool = False) -> bool:
-        self.refresh_api_session()
-        
-        if not self.bybit_initialized:
-            self._init_bybit()
-            if not self.bybit_initialized:
-                return False
-        
-        health = await self.bybit.check_api_health()
-        user_id = self.authorized_user_id
-        
-        if health['success']:
-            if not self._api_was_working:
-                self._api_was_working = True
-                self._api_error_count = 0
-                self.db.set_api_status('working')
-                self.db.set_api_error_message('')
-                
-                if user_id and not is_startup:
-                    message = (
-                        "✅ *API Bybit восстановлен!*\n\n"
-                        "🔑 Ключи работают корректно.\n"
-                        "🕐 Время проверки: `{}`"
-                    ).format(get_moscow_time().strftime('%H:%M:%S'))
-                    await safe_send_message(self.application.bot, user_id, message, parse_mode='Markdown')
-                    logger.info("API recovery notification sent")
-            return True
-        else:
-            self._api_was_working = False
-            self._api_error_count += 1
-            self.db.set_api_status('error')
-            self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
-            
-            if user_id and (is_startup or self._api_error_count % 3 == 0):
-                error_code = health.get('error_code', 'N/A')
-                user_message = health.get('user_message', 'Неизвестная ошибка')
-                
-                message = (
-                    "🚨 *ОШИБКА API BYBIT!*\n\n"
-                    "❌ Статус: НЕ РАБОТАЕТ\n"
-                    "📝 Ошибка: {}\n"
-                    "🔢 Код: {}\n\n"
-                    "⚠️ *Что делать:*\n"
-                    "1️⃣ Проверьте API ключ в файле `.env`\n"
-                    "2️⃣ Убедитесь, что ключ активен\n"
-                    "3️⃣ Проверьте права доступа\n"
-                    "4️⃣ Проверьте IP в белом списке Bybit\n\n"
-                    "🔄 Бот будет проверять доступ каждые 6 часов."
-                ).format(user_message, error_code)
-                await safe_send_message(self.application.bot, user_id, message, parse_mode='Markdown')
-                logger.info(f"API error notification sent (attempt {self._api_error_count})")
-            return False
-    
-    async def cmd_check_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return
-        
-        await update.message.reply_text("🔍 Проверяю API ключ...")
-        
-        self.refresh_api_session()
-        
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ API не инициализирован. Проверьте .env файл.")
-            return
-        
-        health = await self.bybit.check_api_health()
-        
-        if health['success']:
-            self._api_was_working = True
-            self.db.set_api_status('working')
-            self.db.set_api_error_message('')
-            message = (
-                "✅ *API Bybit работает корректно!*\n\n"
-                "🔑 Ключ активен и имеет необходимые права.\n"
-                "🕐 Время проверки: `{}`"
-            ).format(get_moscow_time().strftime('%H:%M:%S'))
-            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
-        else:
-            error_code = health.get('error_code', 'N/A')
-            user_message = health.get('user_message', 'Неизвестная ошибка')
-            
-            message = (
-                "🚨 *КРИТИЧЕСКАЯ ОШИБКА API BYBIT!*\n\n"
-                "❌ Статус: `НЕ РАБОТАЕТ`\n"
-                "📝 Ошибка: `{}`\n"
-                "🔢 Код: `{}`\n\n"
-                "⚠️ *Что делать:*\n"
-                "1️⃣ Проверьте API ключ в файле `.env`\n"
-                "2️⃣ Убедитесь, что ключ активен (выдается на 90 дней)\n"
-                "3️⃣ Проверьте права доступа (нужны: spot trade, wallet read)\n"
-                "4️⃣ Проверьте IP в белом списке Bybit"
-            ).format(user_message, error_code)
-            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
-    
-    async def cmd_refresh_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return
-        
-        await update.message.reply_text("🔄 Обновляю API ключи из .env...")
-        
-        load_dotenv()
-        api_key = os.getenv('BYBIT_API_KEY')
-        api_secret = os.getenv('BYBIT_API_SECRET')
-        
-        if not api_key or not api_secret:
-            await update.message.reply_text("❌ Ключи не найдены в .env файле!")
-            return
-        
-        await update.message.reply_text(f"✅ Ключи найдены:\nAPI Key: {api_key[:8]}...{api_key[-4:]}")
-        
-        self.refresh_api_session()
-        
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ Не удалось создать сессию Bybit")
-            return
-        
-        await update.message.reply_text("🔍 Проверяю работоспособность ключей...")
-        health = await self.bybit.check_api_health()
-        
-        if health['success']:
-            self._api_was_working = True
-            self.db.set_api_status('working')
-            self.db.set_api_error_message('')
-            await update.message.reply_text(
-                "✅ *API Bybit работает корректно!*\n\n"
-                "🔑 Ключи актуальны и имеют необходимые права.",
-                parse_mode='Markdown'
-            )
-        else:
-            error_code = health.get('error_code', 'N/A')
-            user_message = health.get('user_message', 'Неизвестная ошибка')
-            message = (
-                "❌ *Ошибка API*\n\n"
-                "📝 {}\n"
-                "🔢 Код: {}\n\n"
-                "Проверьте ключи в .env файле."
-            ).format(user_message, error_code)
-            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
-    
-    async def _check_user_fast(self, update: Update) -> bool:
-        user = update.effective_user
-        username = f"@{user.username}" if user.username else f"ID:{user.id}"
-        if self.authorized_user_id is None:
-            if username == AUTHORIZED_USER:
-                self.authorized_user_id = user.id
-                self.db.set_authorized_user_id(user.id)
-                logger.info(f"Authorized user ID saved: {user.id}")
-                return True
-        elif user.id == self.authorized_user_id:
-            return True
-        await update.message.reply_text("⛔ Доступ запрещен")
-        return False
-    
-    async def _reset_bot_state(self, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data.clear()
-        self.import_waiting = False
     
     def get_main_keyboard(self):
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
@@ -4319,7 +4168,7 @@ class FastDCABot:
     
     def get_settings_keyboard(self):
         mode = self.db.get_trading_mode()
-        mode_button = "🌐 Режим: Демо" if mode == 'demo' else "🌐 Режим: Обычный"
+        mode_button = "🌐 Режим: Суб-аккаунт" if mode == 'sub_account' else "🌐 Режим: Обычный"
         manual_amount = self.db.get_manual_amount()
         keyboard = [
             [KeyboardButton("🪙 Выбор токена"), KeyboardButton("🚀 Настройки Авто DCA")],
@@ -4408,7 +4257,7 @@ class FastDCABot:
         await self._reset_bot_state(context)
         current_time = get_moscow_time()
         mode = self.db.get_trading_mode()
-        mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
+        mode_text = "Суб-аккаунт" if mode == 'sub_account' else "Обычный"
         
         api_status_text = "❌ НЕ РАБОТАЕТ"
         health = None
@@ -4492,13 +4341,14 @@ class FastDCABot:
             return SELECTING_ACTION
         
         current_mode = self.db.get_trading_mode()
-        new_mode = 'demo' if current_mode == 'real' else 'real'
+        new_mode = 'sub_account' if current_mode == 'real' else 'real'
         self.db.set_trading_mode(new_mode)
         
         self.bybit_initialized = False
         self._init_bybit()
         
-        mode_text = "Демо-режим" if new_mode == 'demo' else "Обычный режим"
+        mode_text = "Суб-аккаунт" if new_mode == 'sub_account' else "Обычный"
+        
         await update.message.reply_text(
             f"✅ Режим изменён на: *{mode_text}*\n\n"
             f"Клиент Bybit переподключён.",
@@ -5281,7 +5131,7 @@ class FastDCABot:
         current_time = get_moscow_time()
         next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
         mode = self.db.get_trading_mode()
-        mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
+        mode_text = "Суб-аккаунт" if mode == 'sub_account' else "Обычный"
         
         api_status = self.db.get_api_status()
         api_error = self.db.get_api_error_message()
@@ -5456,7 +5306,7 @@ class FastDCABot:
         symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         profit_percent = self.db.get_setting('profit_percent', str(PROFIT_PERCENT))
         mode = self.db.get_trading_mode()
-        mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
+        mode_text = "Суб-аккаунт" if mode == 'sub_account' else "Обычный"
         manual_amount = self.db.get_manual_amount()
         await update.message.reply_text(
             f"⚙️ *Настройки*\n\n"
@@ -6603,6 +6453,24 @@ class FastDCABot:
         self.db.reset_incremental_check_time()
         await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
     
+    async def _check_user_fast(self, update: Update) -> bool:
+        user = update.effective_user
+        username = f"@{user.username}" if user.username else f"ID:{user.id}"
+        if self.authorized_user_id is None:
+            if username == AUTHORIZED_USER:
+                self.authorized_user_id = user.id
+                self.db.set_authorized_user_id(user.id)
+                logger.info(f"Authorized user ID saved: {user.id}")
+                return True
+        elif user.id == self.authorized_user_id:
+            return True
+        await update.message.reply_text("⛔ Доступ запрещен")
+        return False
+    
+    async def _reset_bot_state(self, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data.clear()
+        self.import_waiting = False
+    
     async def post_init(self, application: Application):
         if self._is_running:
             logger.warning("Bot already running, skipping post_init")
@@ -6752,7 +6620,7 @@ class FastDCABot:
                     MessageHandler(filters.Regex('^(💵 Сумма для ручного ордера)$'), self.set_manual_amount_start),
                     MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings),
                     MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings),
-                    MessageHandler(filters.Regex('^🌐 Режим: (Обычный|Демо)$'), self.toggle_trading_mode),
+                    MessageHandler(filters.Regex('^🌐 Режим: (Обычный|Суб-аккаунт)$'), self.toggle_trading_mode),
                     MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export),
                     MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.handle_import_start),
                     MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
@@ -6836,6 +6704,148 @@ class FastDCABot:
         
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         logger.info("Handlers setup completed")
+    
+    async def check_api_and_notify(self, is_startup: bool = False) -> bool:
+        self.refresh_api_session()
+        
+        if not self.bybit_initialized:
+            self._init_bybit()
+            if not self.bybit_initialized:
+                return False
+        
+        health = await self.bybit.check_api_health()
+        user_id = self.authorized_user_id
+        
+        if health['success']:
+            if not self._api_was_working:
+                self._api_was_working = True
+                self._api_error_count = 0
+                self.db.set_api_status('working')
+                self.db.set_api_error_message('')
+                
+                if user_id and not is_startup:
+                    message = (
+                        "✅ *API Bybit восстановлен!*\n\n"
+                        "🔑 Ключи работают корректно.\n"
+                        "🕐 Время проверки: `{}`"
+                    ).format(get_moscow_time().strftime('%H:%M:%S'))
+                    await safe_send_message(self.application.bot, user_id, message, parse_mode='Markdown')
+                    logger.info("API recovery notification sent")
+            return True
+        else:
+            self._api_was_working = False
+            self._api_error_count += 1
+            self.db.set_api_status('error')
+            self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
+            
+            if user_id and (is_startup or self._api_error_count % 3 == 0):
+                error_code = health.get('error_code', 'N/A')
+                user_message = health.get('user_message', 'Неизвестная ошибка')
+                
+                message = (
+                    "🚨 *ОШИБКА API BYBIT!*\n\n"
+                    "❌ Статус: НЕ РАБОТАЕТ\n"
+                    "📝 Ошибка: {}\n"
+                    "🔢 Код: {}\n\n"
+                    "⚠️ *Что делать:*\n"
+                    "1️⃣ Проверьте API ключ в файле `.env`\n"
+                    "2️⃣ Убедитесь, что ключ активен\n"
+                    "3️⃣ Проверьте права доступа\n"
+                    "4️⃣ Проверьте IP в белом списке Bybit\n"
+                    "5️⃣ Если используете суб-аккаунт, включите режим 'Суб-аккаунт' в настройках\n\n"
+                    "🔄 Бот будет проверять доступ каждые 6 часов."
+                ).format(user_message, error_code)
+                await safe_send_message(self.application.bot, user_id, message, parse_mode='Markdown')
+                logger.info(f"API error notification sent (attempt {self._api_error_count})")
+            return False
+    
+    async def cmd_check_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_user_fast(update):
+            return
+        
+        await update.message.reply_text("🔍 Проверяю API ключ...")
+        
+        self.refresh_api_session()
+        
+        if not self.bybit_initialized:
+            await update.message.reply_text("❌ API не инициализирован. Проверьте .env файл.")
+            return
+        
+        health = await self.bybit.check_api_health()
+        
+        if health['success']:
+            self._api_was_working = True
+            self.db.set_api_status('working')
+            self.db.set_api_error_message('')
+            message = (
+                "✅ *API Bybit работает корректно!*\n\n"
+                "🔑 Ключ активен и имеет необходимые права.\n"
+                "🕐 Время проверки: `{}`"
+            ).format(get_moscow_time().strftime('%H:%M:%S'))
+            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
+        else:
+            error_code = health.get('error_code', 'N/A')
+            user_message = health.get('user_message', 'Неизвестная ошибка')
+            
+            message = (
+                "🚨 *КРИТИЧЕСКАЯ ОШИБКА API BYBIT!*\n\n"
+                "❌ Статус: `НЕ РАБОТАЕТ`\n"
+                "📝 Ошибка: `{}`\n"
+                "🔢 Код: `{}`\n\n"
+                "⚠️ *Что делать:*\n"
+                "1️⃣ Проверьте API ключ в файле `.env`\n"
+                "2️⃣ Убедитесь, что ключ активен (выдается на 90 дней)\n"
+                "3️⃣ Проверьте права доступа (нужны: spot trade, wallet read)\n"
+                "4️⃣ Проверьте IP в белом списке Bybit\n"
+                "5️⃣ Если используете суб-аккаунт, включите режим 'Суб-аккаунт' в настройках"
+            ).format(user_message, error_code)
+            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
+    
+    async def cmd_refresh_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_user_fast(update):
+            return
+        
+        await update.message.reply_text("🔄 Обновляю API ключи из .env...")
+        
+        load_dotenv()
+        api_key = os.getenv('BYBIT_API_KEY')
+        api_secret = os.getenv('BYBIT_API_SECRET')
+        
+        if not api_key or not api_secret:
+            await update.message.reply_text("❌ Ключи не найдены в .env файле!")
+            return
+        
+        await update.message.reply_text(f"✅ Ключи найдены:\nAPI Key: {api_key[:8]}...{api_key[-4:]}")
+        
+        self.refresh_api_session()
+        
+        if not self.bybit_initialized:
+            await update.message.reply_text("❌ Не удалось создать сессию Bybit")
+            return
+        
+        await update.message.reply_text("🔍 Проверяю работоспособность ключей...")
+        health = await self.bybit.check_api_health()
+        
+        if health['success']:
+            self._api_was_working = True
+            self.db.set_api_status('working')
+            self.db.set_api_error_message('')
+            await update.message.reply_text(
+                "✅ *API Bybit работает корректно!*\n\n"
+                "🔑 Ключи актуальны и имеют необходимые права.",
+                parse_mode='Markdown'
+            )
+        else:
+            error_code = health.get('error_code', 'N/A')
+            user_message = health.get('user_message', 'Неизвестная ошибка')
+            message = (
+                "❌ *Ошибка API*\n\n"
+                "📝 {}\n"
+                "🔢 Код: {}\n\n"
+                "Проверьте ключи в .env файле.\n"
+                "Если используете суб-аккаунт, включите режим 'Суб-аккаунт' в настройках."
+            ).format(user_message, error_code)
+            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
     
     def run(self):
         if self._is_running:
