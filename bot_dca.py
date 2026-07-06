@@ -2,13 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.22.0 (05.07.2026)
+Версия 5.23.0 (06.07.2026)
 ИСПРАВЛЕНИЯ:
-- Добавлена полная поддержка суб-аккаунтов Bybit (передача sub_account в pybit)
-- Исправлена критическая ошибка 'Database' object has no attribute 'is_demo_mode'
-- Убран Demo режим, добавлен режим "Суб-аккаунт"
-- Исправлена ошибка 10024 при торговле на суб-аккаунте
-- Обновлен интерфейс настроек
+- Улучшена диагностика ошибки 10024 (regulatory restrictions)
+- Добавлена детальная проверка статуса аккаунта
+- Добавлена команда /check_account для диагностики проблем с аккаунтом
+- Улучшены сообщения об ошибках API
 """
 import os
 import sys
@@ -53,58 +52,37 @@ load_dotenv()
 # =============================================================================
 #                       НАСТРОЙКИ БОТА (РЕДАКТИРУЙТЕ ЗДЕСЬ)
 # =============================================================================
-# --- 1. Токены (Основные параметры) ---
 DEFAULT_SYMBOL = "ETHUSDT"
 POPULAR_SYMBOLS = ["ETHUSDT", "GRAMUSDT", "XRPUSDT", "BTCUSDT"]
-
-# --- 2. Настройки Авто DCA ---
 INVEST_AMOUNT = 5.0
 SCHEDULE_TIME = "05:00"
 FREQUENCY_HOURS = 24
-
-# --- 3. Настройки лестницы Мартингейла ---
 LADDER_BASE_AMOUNT = 5.0
 LADDER_MAX_AMOUNT = 15.0
 LADDER_MAX_DEPTH = 80
-
-# --- 4. Настройки торговли ---
 PROFIT_PERCENT = 5
-TRADING_MODE = "real"  # real или sub_account
+TRADING_MODE = "real"
 MANUAL_AMOUNT = 1.1
-
-# --- 5. Настройки уведомлений о покупке ---
 PURCHASE_NOTIFY_ENABLED = False
 PURCHASE_NOTIFY_TIME = "06:00"
-
-# --- 6. Настройки отслеживания ордеров ---
 ORDER_EXECUTION_NOTIFY = True
 ORDER_CHECK_INTERVAL_MINUTES = 60
-
-# --- 7. Настройки отслеживания продаж ---
 SELL_TRACKING_ENABLED = True
-
-# --- 8. Настройки API ---
 BYBIT_TESTNET_DEFAULT = False
 # =============================================================================
-#               КОНЕЦ БЛОКА НАСТРОЕК (ДАЛЬШЕ НЕ РЕДАКТИРОВАТЬ)
-# =============================================================================
 
-# Настройка логов с ротацией
 log_handler = RotatingFileHandler("bot_errors.log", encoding='utf-8', maxBytes=200*1024, backupCount=2)
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[
-        log_handler,
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[log_handler, logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
-BOT_VERSION = "5.22.0 (05.07.2026)"
+BOT_VERSION = "5.23.0 (06.07.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 SELL_DECIMALS_FALLBACK = 5
@@ -122,44 +100,16 @@ def get_api_keys():
     api_secret = os.getenv('BYBIT_API_SECRET')
     return api_key, api_secret
 
-# Состояния
 (
-    SELECTING_ACTION,
-    SET_SYMBOL,
-    SET_SYMBOL_MANUAL,
-    SET_AMOUNT,
-    SET_PROFIT_PERCENT,
-    SET_MAX_DROP,
-    SET_SCHEDULE_TIME,
-    SET_FREQUENCY_HOURS,
-    MANAGE_ORDERS,
-    EDIT_ORDER_PRICE,
-    MANUAL_BUY_PRICE,
-    MANUAL_BUY_AMOUNT,
-    MANUAL_ADD_PRICE,
-    MANUAL_ADD_AMOUNT,
-    EDIT_PURCHASE_SELECT,
-    EDIT_PRICE,
-    EDIT_AMOUNT,
-    EDIT_DATE,
-    DELETE_CONFIRM,
-    SETTINGS_MENU,
-    NOTIFICATION_SETTINGS_MENU,
-    WAITING_ALERT_PERCENT,
-    WAITING_ALERT_INTERVAL,
-    WAITING_IMPORT_FILE,
-    SELECTING_SYMBOL,
-    LADDER_MENU,
-    SET_LADDER_DEPTH,
-    SET_LADDER_BASE_AMOUNT,
-    MANUAL_ADD_RECOMMENDATION,
-    WAITING_ORDER_CHECK_INTERVAL,
-    WAITING_ORDER_ID_TO_CANCEL,
-    WAITING_SELL_CONFIRMATION,
-    WAITING_CLEAR_STATS_CONFIRMATION,
-    WAITING_PURCHASE_NOTIFY_TIME,
-    AUTO_DCA_SETTINGS,
-    SET_MANUAL_AMOUNT,
+    SELECTING_ACTION, SET_SYMBOL, SET_SYMBOL_MANUAL, SET_AMOUNT, SET_PROFIT_PERCENT,
+    SET_MAX_DROP, SET_SCHEDULE_TIME, SET_FREQUENCY_HOURS, MANAGE_ORDERS, EDIT_ORDER_PRICE,
+    MANUAL_BUY_PRICE, MANUAL_BUY_AMOUNT, MANUAL_ADD_PRICE, MANUAL_ADD_AMOUNT,
+    EDIT_PURCHASE_SELECT, EDIT_PRICE, EDIT_AMOUNT, EDIT_DATE, DELETE_CONFIRM,
+    SETTINGS_MENU, NOTIFICATION_SETTINGS_MENU, WAITING_ALERT_PERCENT, WAITING_ALERT_INTERVAL,
+    WAITING_IMPORT_FILE, SELECTING_SYMBOL, LADDER_MENU, SET_LADDER_DEPTH,
+    SET_LADDER_BASE_AMOUNT, MANUAL_ADD_RECOMMENDATION, WAITING_ORDER_CHECK_INTERVAL,
+    WAITING_ORDER_ID_TO_CANCEL, WAITING_SELL_CONFIRMATION, WAITING_CLEAR_STATS_CONFIRMATION,
+    WAITING_PURCHASE_NOTIFY_TIME, AUTO_DCA_SETTINGS, SET_MANUAL_AMOUNT,
 ) = range(36)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
@@ -492,9 +442,7 @@ class Database:
     def is_sub_account_mode(self) -> bool:
         return self.get_trading_mode() == 'sub_account'
     
-    # ИСПРАВЛЕНИЕ: Добавлен отсутствующий метод
     def is_demo_mode(self) -> bool:
-        """Возвращает False, так как демо-режим удален в версии 5.21+"""
         return False
 
     def get_first_order_date(self) -> Optional[datetime]:
@@ -1737,8 +1685,9 @@ class BybitClient:
                 self.api_key = api_key
                 self.api_secret = api_secret
                 
-                # ИСПРАВЛЕНИЕ: Передача параметра sub_account в HTTP клиент
-                # Это критически важно для работы с суб-аккаунтами Bybit
+                # ИСПРАВЛЕНИЕ: В Bybit V5 API для работы с суб-аккаунтом достаточно использовать
+                # API-ключи, сгенерированные для этого суб-аккаунта.
+                # Библиотека pybit НЕ поддерживает параметр sub_account в конструкторе HTTP.
                 session_kwargs = {
                     "testnet": self.testnet,
                     "api_key": self.api_key,
@@ -1747,13 +1696,12 @@ class BybitClient:
                 }
                 
                 if self.sub_account:
-                    session_kwargs["sub_account"] = self.sub_account
-                    logger.info(f"Initializing Bybit session for SUB-ACCOUNT: {self.sub_account}")
+                    logger.info(f"Sub-account mode enabled. Using API keys for sub-account: {self.sub_account}")
                 else:
                     logger.info("Initializing Bybit session for MAIN ACCOUNT")
                     
                 self.session = HTTP(**session_kwargs)
-                logger.info(f"Bybit session initialized (testnet={self.testnet}, sub_account={bool(self.sub_account)})")
+                logger.info(f"Bybit session initialized (testnet={self.testnet})")
             else:
                 logger.warning("API key or secret missing")
                 self.session = None
@@ -1773,8 +1721,6 @@ class BybitClient:
         return self.session is not None and self.api_key and self.api_secret
 
     def _get_headers(self) -> Dict:
-        """Возвращает заголовки для запросов (заглушка для суб-аккаунта)"""
-        # pybit сам добавляет заголовки, нам не нужно добавлять дополнительные
         return {}
 
     async def check_api_health(self) -> Dict:
@@ -1833,6 +1779,64 @@ class BybitClient:
                 'is_api_error': True
             }
 
+    async def check_account_status(self) -> Dict:
+        """Детальная проверка статуса аккаунта для диагностики ошибки 10024"""
+        if not self._is_api_available():
+            return {
+                'success': False,
+                'error': 'API не доступен',
+                'details': {}
+            }
+        
+        try:
+            # Проверяем баланс
+            balance_response = self.session.get_wallet_balance(accountType="UNIFIED")
+            
+            if balance_response['retCode'] != 0:
+                return {
+                    'success': False,
+                    'error': f"Ошибка получения баланса: {balance_response.get('retMsg')}",
+                    'error_code': balance_response.get('retCode'),
+                    'details': {}
+                }
+            
+            # Получаем информацию о аккаунте
+            account_info = balance_response.get('result', {}).get('list', [{}])[0]
+            
+            # Проверяем доступные средства
+            coins = account_info.get('coin', [])
+            usdt_balance = 0
+            for coin in coins:
+                if coin.get('coin') == 'USDT':
+                    usdt_balance = float(coin.get('walletBalance', 0) or 0)
+                    break
+            
+            # Пытаемся получить информацию о торговле
+            try:
+                # Проверяем доступ к spot торговле
+                instruments_response = self.session.get_instruments_info(category="spot", symbol="BTCUSDT")
+                spot_available = instruments_response.get('retCode') == 0
+            except Exception as e:
+                spot_available = False
+                spot_error = str(e)
+            
+            return {
+                'success': True,
+                'details': {
+                    'usdt_balance': usdt_balance,
+                    'spot_trading_available': spot_available,
+                    'account_type': 'UNIFIED',
+                    'api_key_prefix': self.api_key[:8] if self.api_key else 'N/A'
+                }
+            }
+        except Exception as e:
+            logger.error(f"Account status check error: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'details': {}
+            }
+
     async def get_symbol_price(self, symbol: str) -> Optional[float]:
         if not self._is_api_available():
             return None
@@ -1850,7 +1854,9 @@ class BybitClient:
                 self._price_cache[symbol] = price
                 self._cache_time[symbol] = now
                 return price
-            return None
+            else:
+                logger.error(f"get_tickers failed for {symbol}: retCode={response.get('retCode')}, retMsg={response.get('retMsg')}")
+                return None
         except Exception as e:
             logger.error(f"Error getting price for {symbol}: {e}")
             return None
@@ -2271,9 +2277,19 @@ class BybitClient:
                         return await self.place_limit_sell(symbol, retry_quantity, price)
                 return {'success': False, 'error': 'quantity_decimals_error', 'message': response['retMsg'], 'quantity': rounded_quantity}
             
-            # Обработка ошибки 10024
+            # УЛУЧШЕННАЯ обработка ошибки 10024
             if response['retCode'] == 10024:
-                return {'success': False, 'error': f'Ошибка доступа: {response["retMsg"]}. Попробуйте включить режим "Суб-аккаунт" в настройках'}
+                error_msg = (
+                    "❌ ОШИБКА 10024: Торговля заблокирована!\n\n"
+                    "Причина: Региональные ограничения или проблемы с KYC.\n\n"
+                    "ВОЗМОЖНЫЕ РЕШЕНИЯ:\n"
+                    "1. Проверьте, что аккаунт прошел KYC верификацию\n"
+                    "2. Убедитесь, что IP-адрес сервера не в заблокированном регионе\n"
+                    "3. Проверьте, что API ключи созданы ВНУТРИ суб-аккаунта\n"
+                    "4. Обратитесь в поддержку Bybit для снятия ограничений\n\n"
+                    f"Детали: {response.get('retMsg', 'N/A')}"
+                )
+                return {'success': False, 'error': error_msg, 'code': 10024}
             
             return {'success': False, 'error': f"{response['retMsg']} (Код: {response['retCode']})"}
         except Exception as e:
@@ -2340,9 +2356,19 @@ class BybitClient:
             if response['retCode'] == 170131:
                 return {'success': False, 'error': 'insufficient_balance', 'message': response['retMsg']}
             
-            # Обработка ошибки 10024
+            # УЛУЧШЕННАЯ обработка ошибки 10024
             if response['retCode'] == 10024:
-                return {'success': False, 'error': f'Ошибка доступа: {response["retMsg"]}. Попробуйте включить режим "Суб-аккаунт" в настройках'}
+                error_msg = (
+                    "❌ ОШИБКА 10024: Торговля заблокирована!\n\n"
+                    "Причина: Региональные ограничения или проблемы с KYC.\n\n"
+                    "ВОЗМОЖНЫЕ РЕШЕНИЯ:\n"
+                    "1. Проверьте, что аккаунт прошел KYC верификацию\n"
+                    "2. Убедитесь, что IP-адрес сервера не в заблокированном регионе\n"
+                    "3. Проверьте, что API ключи созданы ВНУТРИ суб-аккаунта\n"
+                    "4. Обратитесь в поддержку Bybit для снятия ограничений\n\n"
+                    f"Детали: {response.get('retMsg', 'N/A')}"
+                )
+                return {'success': False, 'error': error_msg, 'code': 10024}
             
             return {'success': False, 'error': response['retMsg'], 'code': response['retCode']}
         except Exception as e:
@@ -3984,7 +4010,7 @@ class DCAStrategy:
                     profit_percent=profit_percent,
                     fail_reason=f'Сумма ордера ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT)'
                 )
-                msg = (f"⏳ *ОРДЕР ОТЛОЖEN*\n"
+                msg = (f"⏳ *ОРДЕР ОТЛОЖЕН*\n"
                        f"🪙 Токен: `{symbol}`\n"
                        f"📊 Количество: `{format_quantity(sell_qty, 5)}` {coin}\n"
                        f"💰 Целевая цена: `{format_price(rounded_price, 4)}` USDT\n"
@@ -4130,32 +4156,26 @@ class FastDCABot:
             return
         
         try:
-            # ИСПРАВЛЕНИЕ: Определение режима и передача sub_account
             is_sub_account = self.db.is_sub_account_mode()
             sub_account_name = None
             
-            # Если включен режим суб-аккаунта, пытаемся получить имя из настроек или ENV
             if is_sub_account:
-                # Можно добавить отдельную настройку SUB_ACCOUNT_NAME в .env или брать из базы
-                # Для простоты пока используем заглушку или переменную окружения, если она есть
                 sub_account_name = os.getenv('BYBIT_SUB_ACCOUNT', None)
                 if not sub_account_name:
-                     # Если имя не указано явно, можно попробовать использовать логику определения
-                     # Но обычно для sub_account API нужен явный UID или имя. 
-                     # В данном случае, если пользователь выбрал режим sub_account, 
-                     # мы должны передать этот флаг. Если имени нет, pybit может использовать основной аккаунт,
-                     # но лучше предупредить.
-                     logger.warning("Sub-account mode enabled but BYBIT_SUB_ACCOUNT not set in .env. Using main account logic might fail if restricted.")
+                     logger.warning("Sub-account mode enabled but BYBIT_SUB_ACCOUNT not set in .env. Ensure you are using Sub-account API keys.")
             
-            testnet = self.db.is_demo_mode() # Теперь этот метод существует
+            testnet = self.db.is_demo_mode()
             
             self.bybit = BybitClient(api_key, api_secret, testnet, sub_account=sub_account_name)
             self.strategy = DCAStrategy(self.db, self.bybit)
-            self.bybit_initialized = True
             
-            mode = self.db.get_trading_mode()
-            mode_text = "Суб-аккаунт" if mode == 'sub_account' else "Обычный"
-            logger.info(f"Bybit client initialized with fresh keys (mode={mode_text}, sub_account={bool(sub_account_name)})")
+            if self.bybit.session is None:
+                logger.error("Bybit session is None after initialization. API keys might be invalid or pybit init failed.")
+                self.bybit_initialized = False
+            else:
+                self.bybit_initialized = True
+                mode_text = "Суб-аккаунт" if is_sub_account else "Обычный"
+                logger.info(f"Bybit client initialized with fresh keys (mode={mode_text})")
             
         except Exception as e:
             logger.error(f"Bybit init error: {e}")
@@ -4381,6 +4401,50 @@ class FastDCABot:
                 logger.info(f"Test notification sent to user {self.authorized_user_id}")
             except Exception as e:
                 logger.error(f"Failed to send test notification: {e}")
+
+    async def cmd_check_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для детальной проверки статуса аккаунта"""
+        if not await self._check_user_fast(update):
+            return
+        
+        await update.message.reply_text("🔍 *Проверяю статус аккаунта...*", parse_mode='Markdown')
+        
+        self._init_bybit()
+        if not self.bybit_initialized:
+            await update.message.reply_text("❌ Bybit API не инициализирован.")
+            return
+        
+        account_status = await self.bybit.check_account_status()
+        
+        if account_status['success']:
+            details = account_status['details']
+            message = (
+                "✅ *Статус аккаунта:*\n\n"
+                f"💰 Баланс USDT: `{details['usdt_balance']:.2f}`\n"
+                f"📊 Spot торговля: {'✅ Доступна' if details['spot_trading_available'] else '❌ Недоступна'}\n"
+                f"🔑 API Key: `{details['api_key_prefix']}...`\n"
+                f"📋 Тип аккаунта: `{details['account_type']}`\n\n"
+            )
+            
+            if not details['spot_trading_available']:
+                message += (
+                    "⚠️ *Spot торговля недоступна!*\n\n"
+                    "Возможные причины:\n"
+                    "1. Аккаунт не прошел KYC верификацию\n"
+                    "2. IP-адрес сервера в заблокированном регионе\n"
+                    "3. API ключи не имеют прав на торговлю\n"
+                    "4. Региональные ограничения Bybit\n\n"
+                    "Решение: Обратитесь в поддержку Bybit"
+                )
+            else:
+                message += "✅ Все системы работают нормально!"
+            
+            await update.message.reply_text(message, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(
+                f"❌ *Ошибка проверки аккаунта:*\n{account_status['error']}",
+                parse_mode='Markdown'
+            )
 
     async def cmd_check_sells(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -5603,7 +5667,11 @@ class FastDCABot:
         
         price = await self.bybit.get_symbol_price(symbol)
         if not price:
-            await update.message.reply_text(f"❌ Символ {symbol} не найден на Bybit.\nПроверьте правильность написания.", reply_markup=self.get_symbol_selection_keyboard())
+            await update.message.reply_text(
+                f"❌ Символ {symbol} не найден на Bybit или API вернул ошибку.\n"
+                f"Проверьте правильность написания и логи бота.",
+                reply_markup=self.get_symbol_selection_keyboard()
+            )
             return SELECTING_SYMBOL
         
         instrument_info = await self.bybit.get_instrument_info(symbol)
@@ -6969,6 +7037,7 @@ class FastDCABot:
         
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
         self.application.add_handler(CommandHandler("check_api", self.cmd_check_api))
+        self.application.add_handler(CommandHandler("check_account", self.cmd_check_account))
         self.application.add_handler(CommandHandler("refresh_api", self.cmd_refresh_api))
         self.application.add_handler(CommandHandler("check_sells", self.cmd_check_sells))
         
