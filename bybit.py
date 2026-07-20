@@ -1,14 +1,10 @@
 """
 Telegram бот для работы с Bybit API (субаккаунт)
 Функции:
-  - /start  - приветствие и меню
-  - /balance - показать баланс USDT
-  - Кнопка "Выставить ордер" - лимитный ордер на покупку на 10% ниже рынка
-  
-Автор: Qwen3.7
-Дата: 2026-07-20
+  /start  - приветствие и меню
+  /balance - показать баланс USDT
+  Кнопка "Выставить ордер" - лимитный ордер на покупку на 10% ниже рынка
 """
-
 import os
 import sys
 import time
@@ -21,7 +17,6 @@ from typing import Optional, Tuple
 from dotenv import load_dotenv
 import telebot
 from telebot import types
-from telebot.handler_backends import BaseMiddleware
 from pybit.unified_trading import HTTP
 from pybit.exceptions import FailedRequestError, InvalidRequestError
 
@@ -35,40 +30,34 @@ BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 BYBIT_SUBACCOUNT_UID = os.getenv("BYBIT_SUBACCOUNT_UID", "").strip()
 
-# Проверяем обязательные переменные
 if not TELEGRAM_BOT_TOKEN:
     sys.exit("❌ Ошибка: TELEGRAM_BOT_TOKEN не задан в .env")
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     sys.exit("❌ Ошибка: BYBIT_API_KEY или BYBIT_API_SECRET не заданы в .env")
 
 # ============================================================
-# 2. НАСТРОЙКА ЛОГИРОВАНИЯ (подробное)
+# 2. НАСТРОЙКА ЛОГИРОВАНИЯ
 # ============================================================
 LOG_FILE = "bybit_bot.log"
 
-# Создаём форматтер с миллисекундами для точного тайминга
 log_formatter = logging.Formatter(
     fmt="[%(asctime)s.%(msecs)03d] [%(levelname)s] [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# Хэндлер для файла (подробный)
 file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
 file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(log_formatter)
 
-# Хэндлер для консоли (информативный)
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(log_formatter)
 
-# Корневой логгер
 logger = logging.getLogger("BybitBot")
 logger.setLevel(logging.DEBUG)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-# Логгер для pybit (чтобы видеть HTTP-запросы)
 pybit_logger = logging.getLogger("pybit")
 pybit_logger.setLevel(logging.WARNING)
 pybit_logger.addHandler(file_handler)
@@ -82,20 +71,16 @@ logger.info(f"Bybit Subaccount UID: {BYBIT_SUBACCOUNT_UID or '(не задан -
 # ============================================================
 # 3. ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ
 # ============================================================
-# Telegram бот
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 logger.info("✅ Telegram бот инициализирован")
 
-# Bybit клиент (V5 Unified Trading API)
-# testnet=False - работаем на реальном аккаунте
-# Для работы с субаккаунтом через мастер-ключ используется recv_window
 try:
     bybit_session = HTTP(
         api_key=BYBIT_API_KEY,
         api_secret=BYBIT_API_SECRET,
         testnet=False,
-        recv_window=10000,  # увеличенное окно для стабильности
-        logging_level=logging.DEBUG  # подробное логирование HTTP
+        recv_window=10000,
+        logging_level=logging.DEBUG
     )
     logger.info("✅ Bybit HTTP клиент инициализирован (V5 Unified Trading)")
 except Exception as e:
@@ -107,18 +92,7 @@ except Exception as e:
 # ============================================================
 # 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
-def notify_admin(message: str, level: str = "info") -> None:
-    """
-    Отправляет уведомление админу в Telegram И пишет в лог.
-    Так как TELEGRAM_CHAT_ID не используется - отправляем в тот чат,
-    откуда пришёл запрос (через сохранённый chat_id).
-    """
-    log_method = getattr(logger, level, logger.info)
-    log_method(f"[NOTIFY] {message}")
-
-
 def send_error_to_user(chat_id: int, error: Exception, context: str = "") -> None:
-    """Отправляет понятное сообщение об ошибке пользователю."""
     error_text = f"❌ Ошибка{f' ({context})' if context else ''}:\n`{str(error)[:500]}`"
     try:
         bot.send_message(chat_id, error_text, parse_mode="Markdown")
@@ -127,19 +101,11 @@ def send_error_to_user(chat_id: int, error: Exception, context: str = "") -> Non
 
 
 def get_market_price(symbol: str = "BTCUSDT") -> Tuple[float, str]:
-    """
-    Получает текущую рыночную цену тикера.
-    Возвращает: (цена, категория)
-    """
     logger.info(f"📊 Запрос рыночной цены для {symbol}")
     
-    # Пробуем сначала SPOT, потом LINEAR (фьючерсы)
     for category in ["spot", "linear"]:
         try:
-            response = bybit_session.get_tickers(
-                category=category,
-                symbol=symbol
-            )
+            response = bybit_session.get_tickers(category=category, symbol=symbol)
             logger.debug(f"Ответ get_tickers [{category}]: {response}")
             
             if response.get("retCode") == 0 and response.get("result", {}).get("list"):
@@ -154,30 +120,14 @@ def get_market_price(symbol: str = "BTCUSDT") -> Tuple[float, str]:
 
 
 def get_usdt_balance() -> Tuple[float, float]:
-    """
-    Получает баланс USDT (доступный и общий).
-    Возвращает: (available_balance, total_balance)
-    """
     logger.info("💰 Запрос баланса USDT")
     
     try:
-        # Для субаккаунта через мастер-ключ - передаём заголовок
-        headers = {}
-        if BYBIT_SUBACCOUNT_UID:
-            headers["X-BAPI-SUB-ACCOUNT-UID"] = BYBIT_SUBACCOUNT_UID
-            logger.info(f"Используется субаккаунт UID: {BYBIT_SUBACCOUNT_UID}")
-        
-        # Получаем баланс из UNIFIED аккаунта
-        response = bybit_session.get_wallet_balance(
-            accountType="UNIFIED",
-            coin="USDT"
-        )
+        response = bybit_session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
         logger.debug(f"Ответ get_wallet_balance: {response}")
         
         if response.get("retCode") != 0:
-            raise RuntimeError(
-                f"Bybit вернул ошибку: {response.get('retMsg', 'unknown')}"
-            )
+            raise RuntimeError(f"Bybit вернул ошибку: {response.get('retMsg', 'unknown')}")
         
         result_list = response.get("result", {}).get("list", [])
         if not result_list:
@@ -189,7 +139,9 @@ def get_usdt_balance() -> Tuple[float, float]:
         if not usdt_data:
             raise RuntimeError("USDT не найден в балансе")
         
-        available = float(usdt_data.get("availableToWithdraw", 0) or usdt_data.get("walletBalance", 0))
+        # availableToWithdraw может быть пустой строкой ''
+        available_raw = usdt_data.get("availableToWithdraw") or usdt_data.get("walletBalance", 0)
+        available = float(available_raw)
         total = float(usdt_data.get("walletBalance", 0))
         
         logger.info(f"✅ Баланс USDT: доступно={available}, всего={total}")
@@ -210,70 +162,64 @@ def place_limit_buy_order(
     price: Optional[float] = None,
     category: str = "spot"
 ) -> dict:
-    """
-    Выставляет лимитный ордер на покупку.
+    logger.info(f"📝 Выставление лимитного ордера: {symbol}, сумма={usdt_amount} USDT, категория={category}")
     
-    Args:
-        symbol: торговая пара
-        usdt_amount: сумма в USDT, на которую покупаем
-        price: цена ордера (если None - используется рыночная * 0.9)
-        category: "spot" или "linear"
-    
-    Returns:
-        dict с ответом от Bybit
-    """
-    logger.info(f"📝 Выставление лимитного ордера: {symbol}, сумма={usdt_amount} USDT")
-    
-    # 1. Получаем рыночную цену, если не указана
+    # 1. Получаем рыночную цену
     if price is None:
         market_price, category = get_market_price(symbol)
-        price = market_price * 0.9  # на 10% ниже рынка
+        price = market_price * 0.9
         logger.info(f"💡 Цена ордера: {price} (рынок {market_price} - 10%)")
     else:
         logger.info(f"💡 Цена ордера (указана вручную): {price}")
     
-    # 2. Получаем информацию о инструменте (lot size, tick size)
+    # 2. Получаем информацию об инструменте
     logger.info(f"🔍 Запрос информации об инструменте {symbol}")
-    instruments_response = bybit_session.get_instruments_info(
-        category=category,
-        symbol=symbol
-    )
+    instruments_response = bybit_session.get_instruments_info(category=category, symbol=symbol)
     logger.debug(f"Ответ get_instruments_info: {instruments_response}")
     
     if instruments_response.get("retCode") != 0:
-        raise RuntimeError(
-            f"Ошибка получения информации об инструменте: "
-            f"{instruments_response.get('retMsg')}"
-        )
+        raise RuntimeError(f"Ошибка получения информации об инструменте: {instruments_response.get('retMsg')}")
     
     instrument = instruments_response["result"]["list"][0]
-    lot_size = float(instrument["lotSizeFilter"]["qtyStep"])
-    min_qty = float(instrument["lotSizeFilter"]["minOrderQty"])
+    lot_filter = instrument["lotSizeFilter"]
+    
+    # 🔑 ИСПРАВЛЕНИЕ: для SPOT используется basePrecision, для фьючерсов - qtyStep
+    if category == "spot":
+        lot_size = float(lot_filter.get("basePrecision", "0.000001"))
+        min_qty = float(lot_filter.get("minOrderQty", "0"))
+        min_amt = float(lot_filter.get("minOrderAmt", "0"))
+    else:
+        lot_size = float(lot_filter.get("qtyStep", "0.000001"))
+        min_qty = float(lot_filter.get("minOrderQty", "0"))
+        min_amt = 0
+    
     tick_size = float(instrument["priceFilter"]["tickSize"])
     
-    logger.info(f"📏 Параметры инструмента: lot_step={lot_size}, min_qty={min_qty}, tick_size={tick_size}")
+    logger.info(
+        f"📏 Параметры инструмента: "
+        f"lot_step={lot_size}, min_qty={min_qty}, "
+        f"min_amt={min_amt}, tick_size={tick_size}"
+    )
     
-    # 3. Вычисляем количество (qty) с учётом step
+    # 3. Вычисляем количество
     raw_qty = usdt_amount / price
-    qty = float(Decimal(str(raw_qty)).quantize(
-        Decimal(str(lot_size)), rounding=ROUND_DOWN
-    ))
+    qty = float(Decimal(str(raw_qty)).quantize(Decimal(str(lot_size)), rounding=ROUND_DOWN))
+    price = float(Decimal(str(price)).quantize(Decimal(str(tick_size)), rounding=ROUND_DOWN))
     
-    # Округляем цену до tick_size
-    price = float(Decimal(str(price)).quantize(
-        Decimal(str(tick_size)), rounding=ROUND_DOWN
-    ))
+    logger.info(f"🧮 Расчёт: raw_qty={raw_qty}, qty={qty}, price={price}")
     
-    # Проверяем минимальное количество
-    if qty < min_qty:
+    # 4. Проверки
+    if category == "spot" and min_amt > 0 and usdt_amount < min_amt:
         raise ValueError(
-            f"Рассчитанное количество {qty} меньше минимального {min_qty}. "
-            f"Увеличьте сумму ордера."
+            f"Сумма ордера {usdt_amount} USDT меньше минимальной {min_amt} USDT для этой пары."
         )
     
-    logger.info(f"🧮 Итоговые параметры ордера: qty={qty}, price={price}")
+    if qty < min_qty:
+        raise ValueError(
+            f"Рассчитанное количество {qty} меньше минимального {min_qty}. Увеличьте сумму ордера."
+        )
     
-    # 4. Выставляем ордер
+    # 5. Выставляем ордер
     try:
         order_params = {
             "category": category,
@@ -285,7 +231,6 @@ def place_limit_buy_order(
             "timeInForce": "GTC"
         }
         
-        # Если работаем через мастер-ключ с субаккаунтом
         if BYBIT_SUBACCOUNT_UID:
             order_params["subaccountId"] = BYBIT_SUBACCOUNT_UID
         
@@ -296,8 +241,7 @@ def place_limit_buy_order(
         
         if response.get("retCode") != 0:
             raise RuntimeError(
-                f"Bybit вернул ошибку: {response.get('retMsg')} "
-                f"(код: {response.get('retCode')})"
+                f"Bybit вернул ошибку: {response.get('retMsg')} (код: {response.get('retCode')})"
             )
         
         return response
@@ -313,11 +257,10 @@ def place_limit_buy_order(
 
 
 # ============================================================
-# 5. ОБРАБОТЧИКИ КОМАНД TELEGRAM
+# 5. ОБРАБОТЧИКИ TELEGRAM
 # ============================================================
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message: types.Message) -> None:
-    """Приветствие и главное меню."""
     chat_id = message.chat.id
     logger.info(f"👤 Команда /start от пользователя {chat_id}")
     
@@ -341,10 +284,8 @@ def cmd_start(message: types.Message) -> None:
 
 @bot.message_handler(commands=["balance"])
 def cmd_balance(message: types.Message) -> None:
-    """Показать баланс USDT."""
     chat_id = message.chat.id
     logger.info(f"👤 Команда /balance от пользователя {chat_id}")
-    
     try:
         available, total = get_usdt_balance()
         bot.send_message(
@@ -362,10 +303,8 @@ def cmd_balance(message: types.Message) -> None:
 
 @bot.callback_query_handler(func=lambda call: call.data == "show_balance")
 def callback_show_balance(call: types.CallbackQuery) -> None:
-    """Обработчик кнопки 'Показать баланс'."""
     chat_id = call.message.chat.id
     logger.info(f"🔘 Нажата кнопка 'Показать баланс' (user={chat_id})")
-    
     bot.answer_callback_query(call.id, "⏳ Загружаю баланс...")
     
     try:
@@ -387,33 +326,22 @@ def callback_show_balance(call: types.CallbackQuery) -> None:
 
 @bot.callback_query_handler(func=lambda call: call.data == "place_order")
 def callback_place_order(call: types.CallbackQuery) -> None:
-    """Обработчик кнопки 'Выставить ордер на покупку'."""
     chat_id = call.message.chat.id
     logger.info(f"🔘 Нажата кнопка 'Выставить ордер' (user={chat_id})")
-    
     bot.answer_callback_query(call.id, "⏳ Выставляю ордер...")
     
     try:
-        # 1. Получаем баланс
         available, total = get_usdt_balance()
         logger.info(f"Доступный баланс: {available} USDT")
         
         if available < 10:
-            raise ValueError(
-                f"Недостаточно средств. Доступно: {available:.2f} USDT, "
-                f"нужно минимум 10 USDT для теста."
-            )
+            raise ValueError(f"Недостаточно средств. Доступно: {available:.2f} USDT, нужно минимум 10 USDT.")
         
-        # 2. Используем 10 USDT для теста (или 10% от баланса, если меньше)
         usdt_amount = min(10.0, available * 0.1)
         usdt_amount = round(usdt_amount, 2)
         logger.info(f"Сумма для ордера: {usdt_amount} USDT")
         
-        # 3. Выставляем ордер
-        response = place_limit_buy_order(
-            symbol="BTCUSDT",
-            usdt_amount=usdt_amount
-        )
+        response = place_limit_buy_order(symbol="BTCUSDT", usdt_amount=usdt_amount)
         
         order_id = response["result"]["orderId"]
         order_link = response["result"].get("orderLinkId", "N/A")
@@ -441,7 +369,6 @@ def callback_place_order(call: types.CallbackQuery) -> None:
         logger.exception("Ошибка при выставлении ордера")
         error_msg = str(e)
         
-        # Специальная обработка частых ошибок
         if "insufficient balance" in error_msg.lower():
             error_text = "❌ Недостаточно средств на аккаунте"
         elif "invalid price" in error_msg.lower():
@@ -449,7 +376,7 @@ def callback_place_order(call: types.CallbackQuery) -> None:
         elif "min order" in error_msg.lower():
             error_text = "❌ Сумма ордера меньше минимальной"
         elif "permission" in error_msg.lower() or "access" in error_msg.lower():
-            error_text = "❌ Нет прав на торговлю. Проверьте API-ключ субаккаунта."
+            error_text = "❌ Нет прав на торговлю. Проверьте API-ключ."
         else:
             error_text = f"❌ Ошибка: {error_msg[:300]}"
         
@@ -466,16 +393,12 @@ def callback_place_order(call: types.CallbackQuery) -> None:
 
 @bot.callback_query_handler(func=lambda call: call.data == "account_info")
 def callback_account_info(call: types.CallbackQuery) -> None:
-    """Показать информацию об аккаунте."""
     chat_id = call.message.chat.id
     logger.info(f"🔘 Нажата кнопка 'Информация об аккаунте' (user={chat_id})")
-    
     bot.answer_callback_query(call.id, "⏳ Загружаю информацию...")
     
     try:
-        # Получаем информацию о кошельке
         wallet_info = bybit_session.get_wallet_balance(accountType="UNIFIED")
-        
         account_type = "UNIFIED"
         if wallet_info.get("retCode") == 0 and wallet_info.get("result", {}).get("list"):
             account_type = wallet_info["result"]["list"][0].get("accountType", "UNIFIED")
@@ -495,60 +418,40 @@ def callback_account_info(call: types.CallbackQuery) -> None:
             text=info_text,
             parse_mode="HTML"
         )
-        
     except Exception as e:
         logger.exception("Ошибка при получении информации об аккаунте")
         send_error_to_user(chat_id, e, "информация об аккаунте")
 
 
-# ============================================================
-# 6. ОБРАБОТКА НЕИЗВЕСТНЫХ КОМАНД
-# ============================================================
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_unknown(message: types.Message) -> None:
-    """Обработка неизвестных текстовых сообщений."""
     logger.debug(f"Неизвестное сообщение от {message.chat.id}: {message.text}")
     bot.reply_to(message, "Неизвестная команда. Используйте /start для меню.")
 
 
-# ============================================================
-# 7. ГЛОБАЛЬНАЯ ОБРАБОТКА ИСКЛЮЧЕНИЙ
-# ============================================================
 def global_exception_handler(exctype, value, tb):
-    """Перехват необработанных исключений."""
     logger.critical("💥 НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ:")
     logger.critical("".join(traceback.format_exception(exctype, value, tb)))
 
 sys.excepthook = global_exception_handler
 
 
-# ============================================================
-# 8. ЗАПУСК БОТА
-# ============================================================
 def main() -> None:
-    """Главная функция запуска."""
     logger.info("=" * 60)
     logger.info("🎯 Бот готов к работе. Ожидание команд...")
     logger.info("=" * 60)
     
-    # Проверяем подключение к Bybit
     try:
         logger.info("🔍 Проверка подключения к Bybit API...")
         market_price, _ = get_market_price("BTCUSDT")
         logger.info(f"✅ Подключение к Bybit успешно. BTC/USDT = {market_price}")
     except Exception as e:
         logger.warning(f"⚠️ Не удалось проверить подключение к Bybit: {e}")
-        logger.warning("Бот продолжит работу, но могут быть проблемы с API")
     
-    # Запускаем бота с авто-перезапуском при ошибках
     while True:
         try:
             logger.info("🚀 Запуск polling Telegram...")
-            bot.infinity_polling(
-                timeout=60,
-                long_polling_timeout=60,
-                skip_pending=True
-            )
+            bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
         except Exception as e:
             logger.error(f"❌ Ошибка polling: {e}")
             logger.error(traceback.format_exc())
