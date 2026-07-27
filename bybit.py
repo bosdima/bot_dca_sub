@@ -1,9 +1,9 @@
 """
-Telegram бот для работы с Bybit API (субаккаунт)
-С подробным логированием ошибок для отправки в поддержку Bybit.
+Telegram бот для проверки способности выставлять ордера на Bybit API (V5)
+Использует официальную HMAC-SHA256 подпись согласно документации Bybit.
 
 Автор: Qwen3.7
-Дата: 2026-07-21
+Дата: 2026-07-23
 """
 import os
 import sys
@@ -21,17 +21,38 @@ from typing import Optional, Tuple
 from dotenv import load_dotenv
 import telebot
 from telebot import types
-from pybit.unified_trading import HTTP
-from pybit.exceptions import FailedRequestError, InvalidRequestError
+
+# ============================================================
+# ⚙️ НАСТРОЙКИ БОТА (МЕНЯТЬ ЗДЕСЬ)
+# ============================================================
+# Торговая пара (символ) для торговли
+# Примеры: "BTCUSDT", "ETHUSDT", "GRAMUSDT", "XRPUSDT"
+TRADING_SYMBOL = "BTCUSDT"
+
+# Категория рынка: "spot" (спот) или "linear" (фьючерсы USDT)
+CATEGORY = "spot"
+
+# Минимальная сумма ордера в USDT (защита от ошибки "min order amount")
+# Для BTCUSDT, ETHUSDT, SOLUSDT обычно = 5 USDT
+# Для некоторых альткоинов может быть меньше
+MIN_ORDER_AMOUNT = 5.0
+
+# Желаемая сумма ордера для теста (если баланс позволяет)
+TARGET_ORDER_AMOUNT = 10.0
+
+# Отступ от рыночной цены в процентах
+# Для покупки: цена = рынок × (1 - OFFSET/100)  → ордер НЕ исполнится
+# Для продажи: цена = рынок × (1 + OFFSET/100)  → ордер НЕ исполнится
+PRICE_OFFSET_PERCENT = 10
 
 # ============================================================
 # 1. ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 # ============================================================
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 BYBIT_SUBACCOUNT_UID = os.getenv("BYBIT_SUBACCOUNT_UID", "").strip()
 
 if not TELEGRAM_BOT_TOKEN:
@@ -40,11 +61,9 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     sys.exit("❌ BYBIT_API_KEY или BYBIT_API_SECRET не заданы в .env")
 
 # ============================================================
-# 2. ПОДРОБНОЕ ЛОГИРОВАНИЕ
+# 2. ЛОГИРОВАНИЕ
 # ============================================================
 LOG_FILE = "bybit_bot.log"
-ERROR_REPORT_FILE = "error_report.txt"  # файл для отправки в поддержку
-
 log_formatter = logging.Formatter(
     fmt="[%(asctime)s.%(msecs)03d] [%(levelname)s] [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
@@ -64,366 +83,263 @@ logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
 logger.info("=" * 60)
-logger.info("🚀 Запуск Telegram бота для Bybit")
+logger.info("🚀 Запуск Telegram бота для Bybit (V5 Official Signature)")
 logger.info("=" * 60)
-logger.info(f"Bybit API Key (первые 8 символов): {BYBIT_API_KEY[:8]}...")
-logger.info(f"Bybit Subaccount UID: {BYBIT_SUBACCOUNT_UID or '(не задан)'}")
-
+logger.info(f"📊 Торговая пара: {TRADING_SYMBOL} ({CATEGORY})")
+logger.info(f"💰 Мин. сумма ордера: {MIN_ORDER_AMOUNT} USDT")
+logger.info(f"💵 Желаемая сумма: {TARGET_ORDER_AMOUNT} USDT")
+logger.info(f"📉 Отступ от рынка: {PRICE_OFFSET_PERCENT}%")
+logger.info(f"🔑 Bybit API Key: {BYBIT_API_KEY[:8]}...")
+logger.info(f"🔀 Subaccount UID: {BYBIT_SUBACCOUNT_UID or '(не задан)'}")
 
 # ============================================================
-# 3. НИЗКОУРОВНЕВЫЙ HTTP КЛИЕНТ ДЛЯ ПОДРОБНОГО ЛОГИРОВАНИЯ
+# 3. ОФИЦИАЛЬНЫЙ КЛИЕНТ BYBIT V5 (HMAC-SHA256)
 # ============================================================
-class DetailedBybitClient:
-    """
-    Обёртка над requests, которая логирует ВСЁ:
-    - URL, method, headers, body запроса
-    - Статус код, headers, body ответа
-    - Время выполнения
-    - Подпись (timestamp + recv_window + querystring)
-    """
-    
-    BASE_URL = "https://api.bybit.com"
+class BybitV5Client:
+    """Клиент с официальной подписью Bybit V5"""
     
     def __init__(self, api_key: str, api_secret: str, subaccount_uid: str = ""):
         self.api_key = api_key
         self.api_secret = api_secret
         self.subaccount_uid = subaccount_uid
+        self.base_url = "https://api.bybit.com"
         self.session = requests.Session()
-    
+
     def _generate_signature(self, timestamp: str, recv_window: str, query_string: str) -> str:
-        """Генерация HMAC SHA256 подписи."""
-        sign_str = f"{timestamp}{self.api_key}{recv_window}{query_string}"
+        """Официальный алгоритм подписи Bybit V5:
+        param_str = timestamp + api_key + recv_window + query_string
+        signature = hex(HMAC_SHA256(param_str, secret))
+        """
+        param_str = f"{timestamp}{self.api_key}{recv_window}{query_string}"
         signature = hmac.new(
             self.api_secret.encode("utf-8"),
-            sign_str.encode("utf-8"),
+            param_str.encode("utf-8"),
             hashlib.sha256
         ).hexdigest()
         return signature
-    
-    def request(self, method: str, endpoint: str, params: Optional[dict] = None, body: Optional[dict] = None) -> dict:
-        """
-        Выполняет HTTP запрос с ПОДРОБНЫМ логированием.
-        Возвращает полный ответ для отчёта в поддержку.
-        """
-        url = f"{self.BASE_URL}{endpoint}"
+
+    def request(self, method: str, endpoint: str, payload: Optional[dict] = None) -> dict:
+        """HTTP запрос с официальной подписью"""
         timestamp = str(int(time.time() * 1000))
-        recv_window = "10000"
-        
-        # Формируем заголовки
+        recv_window = "5000"
+
+        if payload and method.upper() == "POST":
+            query_string = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+        elif payload and method.upper() == "GET":
+            query_string = "&".join([f"{k}={v}" for k, v in sorted(payload.items())])
+        else:
+            query_string = ""
+
+        signature = self._generate_signature(timestamp, recv_window, query_string)
+
         headers = {
             "X-BAPI-API-KEY": self.api_key,
             "X-BAPI-TIMESTAMP": timestamp,
             "X-BAPI-RECV-WINDOW": recv_window,
+            "X-BAPI-SIGN": signature,
             "Content-Type": "application/json"
         }
-        
-        # ✅ ВАЖНО: субаккаунт передаётся через ЗАГОЛОВОК, а не в теле!
+
+        # ✅ UID субаккаунта передаётся ТОЛЬКО через заголовок!
         if self.subaccount_uid:
             headers["X-BAPI-SUB-ACCOUNT-UID"] = self.subaccount_uid
-        
-        # Формируем тело/параметры
-        if method.upper() == "GET":
-            query_string = "&".join([f"{k}={v}" for k, v in sorted((params or {}).items())])
-            body_json = None
-        else:
-            query_string = json.dumps(body or {}, separators=(",", ":"), sort_keys=True)
-            body_json = body
-        
-        # Подпись
-        signature = self._generate_signature(timestamp, recv_window, query_string)
-        headers["X-BAPI-SIGN"] = signature
-        
-        # === ПОДРОБНОЕ ЛОГИРОВАНИЕ ЗАПРОСА ===
-        logger.info("=" * 60)
-        logger.info(f"📤 HTTP ЗАПРОС → {method} {url}")
-        logger.info(f"📅 Timestamp: {timestamp}")
-        logger.info(f"🔐 Recv Window: {recv_window}")
-        logger.info(f"🔑 API Key: {self.api_key[:8]}...")
-        if self.subaccount_uid:
-            logger.info(f"🔀 Subaccount UID (в заголовке): {self.subaccount_uid}")
-        logger.info(f"📝 Query/Body: {query_string}")
-        logger.info(f"✍️  Signature: {signature}")
-        logger.info(f"📋 Headers: {json.dumps({k: (v[:20] + '...' if len(str(v)) > 20 else v) for k, v in headers.items()}, indent=2)}")
-        
-        # Выполняем запрос
-        start_time = time.time()
+
+        url = f"{self.base_url}{endpoint}"
+
+        logger.debug(f"📤 {method} {endpoint}")
+        logger.debug(f"🔑 Строка для подписи: {timestamp}{self.api_key}{recv_window}{query_string}")
+        if payload:
+            logger.debug(f"📦 Payload: {query_string}")
+
         try:
             if method.upper() == "GET":
-                response = self.session.get(url, headers=headers, params=params, timeout=10)
+                response = self.session.get(url, headers=headers, params=payload, timeout=10)
             else:
-                response = self.session.post(url, headers=headers, json=body, timeout=10)
-            
-            elapsed = time.time() - start_time
-            
-            # === ПОДРОБНОЕ ЛОГИРОВАНИЕ ОТВЕТА ===
-            logger.info(f"📥 HTTP ОТВЕТ ← {response.status_code} ({elapsed:.3f}s)")
-            logger.info(f"📋 Response Headers: {dict(response.headers)}")
-            
-            try:
-                response_json = response.json()
-                logger.info(f"📦 Response Body: {json.dumps(response_json, indent=2)}")
-            except Exception:
-                logger.info(f"📦 Response Body (raw): {response.text[:1000]}")
-                response_json = {"raw": response.text}
-            
-            logger.info("=" * 60)
-            
-            # Сохраняем полный отчёт
-            report = {
-                "timestamp": datetime.now().isoformat(),
-                "request": {
-                    "method": method,
-                    "url": url,
-                    "timestamp": timestamp,
-                    "recv_window": recv_window,
-                    "api_key_prefix": self.api_key[:8] + "...",
-                    "subaccount_uid": self.subaccount_uid or None,
-                    "query_or_body": query_string,
-                    "signature": signature,
-                    "headers": {k: v for k, v in headers.items() if k != "X-BAPI-SIGN"}
-                },
-                "response": {
-                    "status_code": response.status_code,
-                    "headers": dict(response.headers),
-                    "body": response_json,
-                    "elapsed_seconds": round(elapsed, 3)
-                }
-            }
-            
-            # Сохраняем последний отчёт в файл
-            with open(ERROR_REPORT_FILE, "w", encoding="utf-8") as f:
-                json.dump(report, f, indent=2, ensure_ascii=False)
-            
-            return response_json
-            
+                response = self.session.post(url, headers=headers, data=query_string, timeout=10)
+
+            response.raise_for_status()
+            result = response.json()
+            logger.debug(f"📥 Ответ: {json.dumps(result, ensure_ascii=False)}")
+
+            if result.get("retCode") != 0:
+                error_msg = f"Bybit Error {result.get('retCode')}: {result.get('retMsg')}"
+                logger.error(f"❌ {error_msg}")
+                raise RuntimeError(error_msg)
+                
+            return result
+
         except requests.exceptions.RequestException as e:
-            elapsed = time.time() - start_time
-            logger.error(f"❌ Сетевая ошибка: {e} ({elapsed:.3f}s)")
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Сетевая ошибка: {e}")
+            logger.error(f"Ответ сервера: {e.response.text if e.response else 'No response'}")
             raise
 
-
-# ============================================================
-# 4. ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ
-# ============================================================
+# Инициализация
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-logger.info("✅ Telegram бот инициализирован")
-
-# Низкоуровневый клиент для подробного логирования
-detailed_client = DetailedBybitClient(
-    api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET,
-    subaccount_uid=BYBIT_SUBACCOUNT_UID
-)
-
-# Высокоуровневый pybit клиент (для удобства)
-try:
-    bybit_session = HTTP(
-        api_key=BYBIT_API_KEY,
-        api_secret=BYBIT_API_SECRET,
-        testnet=False,
-        recv_window=10000,
-        logging_level=logging.WARNING
-    )
-    logger.info("✅ Bybit HTTP клиент инициализирован")
-except Exception as e:
-    logger.critical(f"❌ Ошибка инициализации Bybit: {e}")
-    sys.exit(1)
+bybit = BybitV5Client(BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_SUBACCOUNT_UID)
+logger.info("✅ Клиенты инициализированы")
 
 
 # ============================================================
-# 5. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 4. БИЗНЕС-ЛОГИКА
 # ============================================================
-def send_error_to_user(chat_id: int, error: Exception, context: str = "") -> None:
-    error_text = f"❌ Ошибка{f' ({context})' if context else ''}:\n`{str(error)[:500]}`"
-    try:
-        bot.send_message(chat_id, error_text, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Не удалось отправить сообщение: {e}")
-
-
-def format_error_for_support(error: Exception, request_info: dict = None) -> str:
-    """
-    Форматирует ошибку для отправки в поддержку Bybit.
-    Включает ВСЮ необходимую информацию для диагностики.
-    """
-    report = []
-    report.append("=" * 60)
-    report.append("📋 ОТЧЁТ ОБ ОШИБКЕ ДЛЯ ПОДДЕРЖКИ BYBIT")
-    report.append("=" * 60)
-    report.append(f"📅 Дата/время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    report.append(f"🔑 API Key (первые 8 символов): {BYBIT_API_KEY[:8]}...")
-    report.append(f"🔀 Subaccount UID: {BYBIT_SUBACCOUNT_UID or '(не используется)'}")
-    report.append("")
+def get_market_price(symbol: str = TRADING_SYMBOL) -> Tuple[float, str]:
+    """Получает текущую рыночную цену"""
+    logger.info(f"📊 Запрос цены для {symbol}")
     
-    report.append("🐍 ИНФОРМАЦИЯ О КЛИЕНТЕ:")
-    report.append(f"  • Python версия: {sys.version}")
-    report.append(f"  • pybit версия: {__import__('pybit').__version__ if hasattr(__import__('pybit'), '__version__') else 'unknown'}")
-    report.append(f"  • OS: {sys.platform}")
-    report.append("")
+    # Пробуем указанную категорию, потом альтернативную
+    categories = [CATEGORY] + (["spot", "linear"] if CATEGORY not in ["spot", "linear"] else [])
+    categories = list(dict.fromkeys(categories))  # убираем дубли
     
-    report.append("❌ ТЕКСТ ОШИБКИ:")
-    report.append(f"  {type(error).__name__}: {str(error)}")
-    report.append("")
-    
-    if request_info:
-        report.append("📤 ДЕТАЛИ ЗАПРОСА:")
-        for k, v in request_info.items():
-            report.append(f"  • {k}: {v}")
-        report.append("")
-    
-    # Пытаемся прочитать последний отчёт из файла
-    try:
-        if os.path.exists(ERROR_REPORT_FILE):
-            with open(ERROR_REPORT_FILE, "r", encoding="utf-8") as f:
-                last_report = json.load(f)
-            
-            report.append("📡 ПОСЛЕДНИЙ HTTP ЗАПРОС:")
-            req = last_report.get("request", {})
-            report.append(f"  • URL: {req.get('url')}")
-            report.append(f"  • Method: {req.get('method')}")
-            report.append(f"  • Timestamp: {req.get('timestamp')}")
-            report.append(f"  • Recv Window: {req.get('recv_window')}")
-            report.append(f"  • API Key: {req.get('api_key_prefix')}")
-            report.append(f"  • Subaccount UID: {req.get('subaccount_uid')}")
-            report.append(f"  • Body/Query: {req.get('query_or_body')}")
-            report.append(f"  • Signature: {req.get('signature')}")
-            report.append("")
-            
-            report.append("📥 ПОСЛЕДНИЙ HTTP ОТВЕТ:")
-            resp = last_report.get("response", {})
-            report.append(f"  • Status Code: {resp.get('status_code')}")
-            report.append(f"  • Elapsed: {resp.get('elapsed_seconds')}s")
-            report.append(f"  • Body: {json.dumps(resp.get('body'), indent=2, ensure_ascii=False)}")
-            report.append("")
-    except Exception as e:
-        report.append(f"⚠️ Не удалось прочитать отчёт: {e}")
-        report.append("")
-    
-    report.append("=" * 60)
-    report.append("💡 ПОЖАЛУЙСТА, ОПИШИТЕ:")
-    report.append("  1. Что вы пытались сделать?")
-    report.append("  2. Когда это произошло?")
-    report.append("  3. Повторяется ли ошибка?")
-    report.append("=" * 60)
-    
-    return "\n".join(report)
-
-
-def get_market_price(symbol: str = "BTCUSDT") -> Tuple[float, str]:
-    logger.info(f"📊 Запрос рыночной цены для {symbol}")
-    
-    for category in ["spot", "linear"]:
+    for category in categories:
         try:
-            response = bybit_session.get_tickers(category=category, symbol=symbol)
-            logger.debug(f"Ответ get_tickers [{category}]: {response}")
-            
-            if response.get("retCode") == 0 and response.get("result", {}).get("list"):
+            response = bybit.request("GET", "/v5/market/tickers", {
+                "category": category, 
+                "symbol": symbol
+            })
+            if response.get("result", {}).get("list"):
                 price = float(response["result"]["list"][0]["lastPrice"])
-                logger.info(f"✅ Рыночная цена {symbol} ({category}): {price}")
+                logger.info(f"✅ Цена {symbol} ({category}): {price}")
                 return price, category
         except Exception as e:
             logger.warning(f"Не удалось получить цену в {category}: {e}")
             continue
     
-    raise RuntimeError(f"Не удалось получить рыночную цену для {symbol}")
+    raise RuntimeError(f"Не удалось получить цену для {symbol}")
 
 
-def get_usdt_balance() -> Tuple[float, float]:
-    logger.info("💰 Запрос баланса USDT")
+def get_instrument_info(symbol: str = TRADING_SYMBOL, category: str = CATEGORY) -> dict:
+    """Получает информацию об инструменте (lot size, tick size, min amount)"""
+    logger.info(f"🔍 Запрос информации об инструменте {symbol}")
+    response = bybit.request("GET", "/v5/market/instruments-info", {
+        "category": category, 
+        "symbol": symbol
+    })
     
-    try:
-        response = bybit_session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-        logger.debug(f"Ответ get_wallet_balance: {response}")
-        
-        if response.get("retCode") != 0:
-            raise RuntimeError(f"Bybit: {response.get('retMsg')}")
-        
-        result_list = response.get("result", {}).get("list", [])
-        if not result_list:
-            raise RuntimeError("Пустой результат баланса")
-        
-        coin_list = result_list[0].get("coin", [])
-        usdt_data = next((c for c in coin_list if c.get("coin") == "USDT"), None)
-        
-        if not usdt_data:
-            raise RuntimeError("USDT не найден")
-        
-        available_raw = usdt_data.get("availableToWithdraw") or usdt_data.get("walletBalance", 0)
-        available = float(available_raw)
-        total = float(usdt_data.get("walletBalance", 0))
-        
-        logger.info(f"✅ Баланс USDT: доступно={available}, всего={total}")
-        return available, total
-        
-    except (FailedRequestError, InvalidRequestError) as e:
-        logger.error(f"Ошибка Bybit API: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Неожиданная ошибка: {e}")
-        logger.error(traceback.format_exc())
-        raise
+    if not response.get("result", {}).get("list"):
+        raise RuntimeError(f"Инструмент {symbol} не найден")
+    
+    return response["result"]["list"][0]
 
 
-def place_order_via_detailed_client(
-    symbol: str = "BTCUSDT",
-    side: str = "Buy",
-    usdt_amount: float = 10.0,
-    price: Optional[float] = None,
-    category: str = "spot"
-) -> dict:
+def get_usdt_balance() -> float:
+    """Получает доступный баланс USDT"""
+    logger.info("💰 Запрос баланса USDT")
+    response = bybit.request("GET", "/v5/account/wallet-balance", {
+        "accountType": "UNIFIED", 
+        "coin": "USDT"
+    })
+    
+    coin_list = response["result"]["list"][0].get("coin", [])
+    usdt_data = next((c for c in coin_list if c.get("coin") == "USDT"), None)
+    
+    if not usdt_data:
+        raise RuntimeError("USDT не найден в балансе")
+    
+    available = float(usdt_data.get("availableToWithdraw") or usdt_data.get("walletBalance", 0))
+    logger.info(f"✅ Доступный баланс USDT: {available}")
+    return available
+
+
+def get_coin_balance(coin: str) -> float:
+    """Получает доступный баланс конкретной монеты (для продажи)"""
+    logger.info(f"💰 Запрос баланса {coin}")
+    response = bybit.request("GET", "/v5/account/wallet-balance", {
+        "accountType": "UNIFIED", 
+        "coin": coin
+    })
+    
+    coin_list = response["result"]["list"][0].get("coin", [])
+    coin_data = next((c for c in coin_list if c.get("coin") == coin), None)
+    
+    if not coin_data:
+        return 0.0
+    
+    available = float(coin_data.get("availableToWithdraw") or coin_data.get("walletBalance", 0))
+    logger.info(f"✅ Доступный баланс {coin}: {available}")
+    return available
+
+
+def place_limit_order(side: str, usdt_amount: Optional[float] = None, coin_amount: Optional[float] = None) -> dict:
     """
-    Выставляет ордер через низкоуровневый клиент с ПОДРОБНЫМ логированием.
-    Это позволит увидеть ВСЁ для отправки в поддержку.
+    Выставляет лимитный ордер на ±PRICE_OFFSET_PERCENT% от рынка.
+    
+    Args:
+        side: "Buy" или "Sell"
+        usdt_amount: сумма в USDT (для Buy)
+        coin_amount: количество монеты (для Sell)
     """
-    logger.info(f"📝 Выставление ордера: {side} {symbol}, {usdt_amount} USDT, категория={category}")
+    symbol = TRADING_SYMBOL
+    category = CATEGORY
+    
+    logger.info(f"📝 Подготовка ордера: {side} {symbol}")
+    logger.info(f"⚙️ Настройки: отступ={PRICE_OFFSET_PERCENT}%, категория={category}")
     
     # 1. Получаем рыночную цену
-    if price is None:
-        market_price, category = get_market_price(symbol)
-        price = market_price * 0.9  # на 10% ниже рынка
-        logger.info(f"💡 Цена ордера: {price} (рынок {market_price} - 10%)")
+    market_price, category = get_market_price(symbol)
     
-    # 2. Получаем информацию об инструменте
-    instruments_response = bybit_session.get_instruments_info(category=category, symbol=symbol)
-    logger.debug(f"Ответ get_instruments_info: {instruments_response}")
+    # 2. Рассчитываем целевую цену (чтобы ордер НЕ исполнился)
+    if side == "Buy":
+        target_price = market_price * (1 - PRICE_OFFSET_PERCENT / 100)
+    else:
+        target_price = market_price * (1 + PRICE_OFFSET_PERCENT / 100)
     
-    if instruments_response.get("retCode") != 0:
-        raise RuntimeError(f"Ошибка инструмента: {instruments_response.get('retMsg')}")
+    logger.info(f"💡 Целевая цена: {target_price:.4f} (рынок: {market_price}, отступ: {PRICE_OFFSET_PERCENT}%)")
     
-    instrument = instruments_response["result"]["list"][0]
-    lot_filter = instrument["lotSizeFilter"]
+    # 3. Получаем информацию об инструменте
+    inst = get_instrument_info(symbol, category)
+    lot_filter = inst["lotSizeFilter"]
     
     # Для SPOT - basePrecision, для фьючерсов - qtyStep
     if category == "spot":
         lot_size = float(lot_filter.get("basePrecision", "0.000001"))
         min_qty = float(lot_filter.get("minOrderQty", "0"))
-        min_amt = float(lot_filter.get("minOrderAmt", "0"))
+        min_amt_api = float(lot_filter.get("minOrderAmt", "0"))
     else:
         lot_size = float(lot_filter.get("qtyStep", "0.000001"))
         min_qty = float(lot_filter.get("minOrderQty", "0"))
-        min_amt = 0
+        min_amt_api = 0
     
-    tick_size = float(instrument["priceFilter"]["tickSize"])
+    tick_size = float(inst["priceFilter"]["tickSize"])
     
-    logger.info(f"📏 Параметры: lot_step={lot_size}, min_qty={min_qty}, min_amt={min_amt}, tick_size={tick_size}")
+    # Берём МАКСИМУМ из настройки пользователя и значения API
+    min_amt = max(MIN_ORDER_AMOUNT, min_amt_api)
     
-    # 3. Вычисляем количество
-    raw_qty = usdt_amount / price
+    logger.info(
+        f"📏 Параметры инструмента: "
+        f"lot_step={lot_size}, min_qty={min_qty}, "
+        f"min_amt_api={min_amt_api}, min_amt={min_amt}, tick_size={tick_size}"
+    )
+    
+    # 4. Рассчитываем количество
+    if side == "Buy":
+        if usdt_amount is None:
+            raise ValueError("Для покупки нужна сумма в USDT")
+        raw_qty = usdt_amount / target_price
+        # Проверяем минимальную сумму
+        if category == "spot" and min_amt > 0 and usdt_amount < min_amt:
+            raise ValueError(
+                f"Сумма {usdt_amount} USDT меньше минимальной {min_amt} USDT "
+                f"для пары {symbol}"
+            )
+    else:  # Sell
+        if coin_amount is None:
+            raise ValueError("Для продажи нужно количество монеты")
+        raw_qty = coin_amount
+    
     qty = float(Decimal(str(raw_qty)).quantize(Decimal(str(lot_size)), rounding=ROUND_DOWN))
-    price = float(Decimal(str(price)).quantize(Decimal(str(tick_size)), rounding=ROUND_DOWN))
+    price = float(Decimal(str(target_price)).quantize(Decimal(str(tick_size)), rounding=ROUND_DOWN))
     
     logger.info(f"🧮 Расчёт: raw_qty={raw_qty}, qty={qty}, price={price}")
     
-    # 4. Проверки
-    if category == "spot" and min_amt > 0 and usdt_amount < min_amt:
-        raise ValueError(f"Сумма {usdt_amount} USDT < минимальной {min_amt} USDT")
-    
     if qty < min_qty:
-        raise ValueError(f"Количество {qty} < минимального {min_qty}")
+        raise ValueError(
+            f"Количество {qty} меньше минимального {min_qty}. "
+            f"Увеличьте сумму ордера."
+        )
     
-    # 5. Выставляем ордер через низкоуровневый клиент (с подробным логом)
-    body = {
+    # 5. Формируем payload
+    # ⚠️ ВАЖНО: subaccountId НЕ добавляется в тело! Он в заголовке.
+    payload = {
         "category": category,
         "symbol": symbol,
         "side": side,
@@ -433,256 +349,291 @@ def place_order_via_detailed_client(
         "timeInForce": "GTC"
     }
     
-    # ✅ НЕ добавляем subaccountId в тело! Он передаётся через заголовок.
+    # 6. Отправляем ордер
+    logger.info(f"📤 Отправка ордера на Bybit...")
+    response = bybit.request("POST", "/v5/order/create", payload)
     
-    request_info = {
-        "endpoint": "/v5/order/create",
-        "method": "POST",
-        "body": json.dumps(body, indent=2),
-        "subaccount_in_header": bool(BYBIT_SUBACCOUNT_UID)
+    order_id = response["result"]["orderId"]
+    logger.info(f"✅ Ордер {side} успешно создан: {order_id}")
+    
+    return {
+        "orderId": order_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "marketPrice": market_price,
+        "offsetPercent": PRICE_OFFSET_PERCENT
     }
-    
-    try:
-        response = detailed_client.request("POST", "/v5/order/create", body=body)
-        
-        if response.get("retCode") != 0:
-            err_code = response.get("retCode")
-            err_msg = response.get("retMsg", "unknown")
-            
-            error_text = format_error_for_support(
-                RuntimeError(f"Bybit retCode={err_code}: {err_msg}"),
-                request_info
-            )
-            
-            # Сохраняем полный отчёт
-            with open("last_error_report.txt", "w", encoding="utf-8") as f:
-                f.write(error_text)
-            
-            logger.error(f"❌ Ошибка Bybit:\n{error_text}")
-            raise RuntimeError(error_text)
-        
-        logger.info(f"✅ Ордер успешно выставлен: {response}")
-        return response
-        
-    except Exception as e:
-        error_text = format_error_for_support(e, request_info)
-        with open("last_error_report.txt", "w", encoding="utf-8") as f:
-            f.write(error_text)
-        logger.error(f"❌ Ошибка:\n{error_text}")
-        raise
 
 
 # ============================================================
-# 6. ОБРАБОТЧИКИ TELEGRAM
+# 5. TELEGRAM ОБРАБОТЧИКИ
 # ============================================================
 @bot.message_handler(commands=["start", "help"])
-def cmd_start(message: types.Message) -> None:
+def cmd_start(message: types.Message):
     chat_id = message.chat.id
     logger.info(f"👤 /start от {chat_id}")
     
+    # Определяем базовую монету (например, BTC из BTCUSDT)
+    base_coin = TRADING_SYMBOL.replace("USDT", "")
+    
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
-        types.InlineKeyboardButton("💰 Показать баланс USDT", callback_data="show_balance"),
-        types.InlineKeyboardButton("📉 Купить BTC (−10% от рынка)", callback_data="place_buy"),
-        types.InlineKeyboardButton("📈 Продать BTC (+10% от рынка)", callback_data="place_sell"),
-        types.InlineKeyboardButton("📋 Получить отчёт об ошибке", callback_data="get_error_report"),
-        types.InlineKeyboardButton("ℹ️ Информация об аккаунте", callback_data="account_info")
+        types.InlineKeyboardButton("💰 Баланс USDT", callback_data="balance_usdt"),
+        types.InlineKeyboardButton(f"💎 Баланс {base_coin}", callback_data="balance_coin"),
+        types.InlineKeyboardButton(
+            f"📉 Купить {base_coin} (-{PRICE_OFFSET_PERCENT}%)", 
+            callback_data="buy"
+        ),
+        types.InlineKeyboardButton(
+            f"📈 Продать {base_coin} (+{PRICE_OFFSET_PERCENT}%)", 
+            callback_data="sell"
+        ),
+        types.InlineKeyboardButton("⚙️ Настройки бота", callback_data="settings")
     )
     
     bot.send_message(
         chat_id,
-        "🤖 <b>Bybit Trading Bot</b>\n\n"
-        "Я работаю с Bybit API (V5 Unified Trading).\n"
-        f"{'🔀 Режим: СУБАККАУНТ (UID: ' + BYBIT_SUBACCOUNT_UID + ')' if BYBIT_SUBACCOUNT_UID else '🏠 Режим: ОСНОВНОЙ АККАУНТ'}\n\n"
-        "Выберите действие:",
+        "🤖 <b>Bybit V5 Test Bot</b>\n\n"
+        "Бот для проверки способности выставлять ордера.\n"
+        "Ордера выставляются лимитные с отступом от рынка,\n"
+        "чтобы они <b>НЕ исполнялись</b>.\n\n"
+        f"📊 <b>Пара:</b> {TRADING_SYMBOL}\n"
+        f"💰 <b>Мин. сумма:</b> {MIN_ORDER_AMOUNT} USDT\n"
+        f"💵 <b>Желаемая сумма:</b> {TARGET_ORDER_AMOUNT} USDT\n"
+        f"📉 <b>Отступ:</b> {PRICE_OFFSET_PERCENT}%\n"
+        f"🏦 <b>Категория:</b> {CATEGORY}\n"
+        f"🔀 <b>Режим:</b> {'СУБАККАУНТ' if BYBIT_SUBACCOUNT_UID else 'ОСНОВНОЙ'}",
         parse_mode="HTML",
         reply_markup=markup
     )
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "show_balance")
-def callback_show_balance(call: types.CallbackQuery) -> None:
-    chat_id = call.message.chat.id
-    logger.info(f"🔘 Кнопка 'Баланс' (user={chat_id})")
-    bot.answer_callback_query(call.id, "⏳ Загружаю баланс...")
-    
+@bot.callback_query_handler(func=lambda call: call.data == "balance_usdt")
+def cb_balance_usdt(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id, "Загрузка...")
     try:
-        available, total = get_usdt_balance()
+        bal = get_usdt_balance()
         bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=call.message.message_id,
-            text=f"💰 <b>Баланс USDT</b>\n\n"
-                 f"📊 Доступно: <code>{available:.4f}</code> USDT\n"
-                 f"💼 Всего: <code>{total:.4f}</code> USDT\n\n"
-                 f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"💰 <b>Баланс USDT</b>\n\n"
+            f"Доступно: <code>{bal:.4f}</code> USDT\n\n"
+            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            call.message.chat.id, 
+            call.message.message_id, 
             parse_mode="HTML"
         )
     except Exception as e:
-        logger.exception("Ошибка при получении баланса")
-        send_error_to_user(chat_id, e, "получение баланса")
+        bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
 
 
-@bot.callback_query_handler(func=lambda call: call.data in ["place_buy", "place_sell"])
-def callback_place_order(call: types.CallbackQuery) -> None:
-    chat_id = call.message.chat.id
-    side = "Buy" if call.data == "place_buy" else "Sell"
-    logger.info(f"🔘 Кнопка '{side}' (user={chat_id})")
-    bot.answer_callback_query(call.id, f"⏳ Выставляю ордер на {side}...")
-    
+@bot.callback_query_handler(func=lambda call: call.data == "balance_coin")
+def cb_balance_coin(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id, "Загрузка...")
+    base_coin = TRADING_SYMBOL.replace("USDT", "")
     try:
-        available, total = get_usdt_balance()
-        
-        if available < 10:
-            raise ValueError(f"Недостаточно средств: {available:.2f} USDT")
-        
-        usdt_amount = min(10.0, available * 0.1)
-        usdt_amount = round(usdt_amount, 2)
-        logger.info(f"Сумма для ордера: {usdt_amount} USDT")
-        
-        response = place_order_via_detailed_client(
-            symbol="BTCUSDT",
-            side=side,
-            usdt_amount=usdt_amount
-        )
-        
-        order_id = response["result"]["orderId"]
-        
-        success_text = (
-            f"✅ <b>Ордер {side} выставлен!</b>\n\n"
-            f"📋 ID: <code>{order_id}</code>\n"
-            f"💵 Сумма: <code>{usdt_amount}</code> USDT\n"
-            f"📉 Тип: Limit {side} (±10% от рынка)\n"
-            f"🎯 Пара: BTCUSDT\n\n"
-            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
+        bal = get_coin_balance(base_coin)
         bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=call.message.message_id,
-            text=success_text,
+            f"💎 <b>Баланс {base_coin}</b>\n\n"
+            f"Доступно: <code>{bal:.8f}</code> {base_coin}\n\n"
+            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            call.message.chat.id, 
+            call.message.message_id, 
             parse_mode="HTML"
         )
-        logger.info(f"✅ Ордер {order_id} выставлен")
-        
     except Exception as e:
-        logger.exception("Ошибка при выставлении ордера")
-        error_msg = str(e)
-        
-        # Отправляем ПОДРОБНЫЙ отчёт в Telegram (разбиваем на части)
-        try:
-            # Читаем отчёт из файла
-            if os.path.exists("last_error_report.txt"):
-                with open("last_error_report.txt", "r", encoding="utf-8") as f:
-                    report = f.read()
-            else:
-                report = format_error_for_support(e)
-            
-            # Разбиваем на части по 4000 символов (лимит Telegram)
-            parts = [report[i:i+4000] for i in range(0, len(report), 4000)]
-            
-            # Отправляем первое сообщение как edit
-            bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=call.message.message_id,
-                text=f"❌ <b>Ошибка при выставлении ордера</b>\n\n"
-                     f"Подробный отчёт в следующих сообщениях ↓",
-                parse_mode="HTML"
-            )
-            
-            # Отправляем остальные части
-            for i, part in enumerate(parts, 1):
-                bot.send_message(
-                    chat_id,
-                    f"📋 <b>Отчёт часть {i}/{len(parts)}</b>\n\n"
-                    f"<pre>{part}</pre>",
-                    parse_mode="HTML"
-                )
-            
-            bot.send_message(
-                chat_id,
-                "💡 <b>Что делать:</b>\n"
-                "1. Скопируйте отчёт выше\n"
-                "2. Отправьте в поддержку Bybit\n"
-                "3. Укажите, что вы пытались сделать\n"
-                "4. Приложите скриншот из Bybit"
-            )
-            
-        except Exception as send_err:
-            logger.error(f"Не удалось отправить отчёт: {send_err}")
-            bot.send_message(
-                chat_id,
-                f"❌ Ошибка: {error_msg[:400]}\n\n"
-                f"Полный отчёт сохранён в файл <code>last_error_report.txt</code>",
-                parse_mode="HTML"
-            )
+        bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "get_error_report")
-def callback_get_error_report(call: types.CallbackQuery) -> None:
-    """Отправляет последний отчёт об ошибке."""
-    chat_id = call.message.chat.id
-    logger.info(f"🔘 Кнопка 'Отчёт об ошибке' (user={chat_id})")
+@bot.callback_query_handler(func=lambda call: call.data == "buy")
+def cb_buy(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id, "Выставляю ордер на покупку...")
+    base_coin = TRADING_SYMBOL.replace("USDT", "")
     
     try:
-        if os.path.exists("last_error_report.txt"):
-            with open("last_error_report.txt", "r", encoding="utf-8") as f:
-                report = f.read()
-            
-            parts = [report[i:i+4000] for i in range(0, len(report), 4000)]
-            
-            for i, part in enumerate(parts, 1):
-                bot.send_message(
-                    chat_id,
-                    f"📋 <b>Отчёт часть {i}/{len(parts)}</b>\n\n"
-                    f"<pre>{part}</pre>",
-                    parse_mode="HTML"
-                )
+        bal = get_usdt_balance()
+        logger.info(f"💰 Доступный баланс: {bal} USDT")
+        
+        # Адаптивный расчёт суммы
+        if bal < MIN_ORDER_AMOUNT:
+            raise ValueError(
+                f"Недостаточно средств. Баланс: {bal:.4f} USDT, "
+                f"минимум: {MIN_ORDER_AMOUNT} USDT"
+            )
+        
+        if bal >= TARGET_ORDER_AMOUNT:
+            amount = TARGET_ORDER_AMOUNT
         else:
-            bot.send_message(chat_id, "ℹ️ Отчётов об ошибках пока нет.")
-    except Exception as e:
-        logger.exception("Ошибка при отправке отчёта")
-        send_error_to_user(chat_id, e, "отчёт об ошибке")
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "account_info")
-def callback_account_info(call: types.CallbackQuery) -> None:
-    chat_id = call.message.chat.id
-    logger.info(f"🔘 Кнопка 'Инфо' (user={chat_id})")
-    bot.answer_callback_query(call.id, "⏳ Загружаю...")
-    
-    try:
-        info_text = (
-            f"ℹ️ <b>Информация об аккаунте</b>\n\n"
-            f"🔑 API Key: <code>{BYBIT_API_KEY[:8]}...{BYBIT_API_KEY[-4:]}</code>\n"
-            f"{'🔀 Субаккаунт UID: <code>' + BYBIT_SUBACCOUNT_UID + '</code>' if BYBIT_SUBACCOUNT_UID else '🏠 Основной аккаунт'}\n"
-            f"🌐 Сеть: <b>Mainnet</b>\n\n"
+            # Используем весь баланс с небольшим запасом на комиссию
+            amount = round(bal - 0.01, 2)
+            if amount < MIN_ORDER_AMOUNT:
+                raise ValueError(
+                    f"После округления сумма {amount} USDT меньше "
+                    f"минимальной {MIN_ORDER_AMOUNT} USDT"
+                )
+        
+        logger.info(f"💵 Сумма для покупки: {amount} USDT")
+        
+        result = place_limit_order(side="Buy", usdt_amount=amount)
+        
+        text = (
+            f"✅ <b>Ордер на покупку создан!</b>\n\n"
+            f"🆔 Order ID: <code>{result['orderId']}</code>\n"
+            f"🎯 Пара: {result['symbol']}\n"
+            f"📉 Тип: Limit Buy\n"
+            f"💵 Сумма: <code>{amount}</code> USDT\n"
+            f"🔢 Количество: <code>{result['qty']}</code> {base_coin}\n"
+            f"💲 Цена ордера: <code>{result['price']}</code> USDT\n"
+            f"📊 Рыночная цена: <code>{result['marketPrice']}</code> USDT\n"
+            f"📏 Отступ от рынка: <code>{result['offsetPercent']}%</code>\n\n"
+            f"💡 Ордер НЕ исполнится, пока цена не упадёт на {result['offsetPercent']}%\n\n"
             f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        
         bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=call.message.message_id,
-            text=info_text,
+            text, 
+            call.message.chat.id, 
+            call.message.message_id, 
             parse_mode="HTML"
         )
+        logger.info(f"✅ Ордер {result['orderId']} создан")
+        
     except Exception as e:
-        logger.exception("Ошибка")
-        send_error_to_user(chat_id, e, "информация")
+        error_text = str(e)
+        logger.exception("Ошибка при создании ордера на покупку")
+        
+        if "10003" in error_text or "sign" in error_text.lower():
+            error_text += "\n\n⚠️ Проверьте API Secret в .env"
+        elif "минимальной" in error_text.lower() or "min" in error_text.lower():
+            error_text += f"\n\n💡 Пополните субаккаунт минимум до {MIN_ORDER_AMOUNT} USDT"
+            
+        bot.send_message(
+            call.message.chat.id, 
+            f"❌ Ошибка:\n<code>{error_text[:400]}</code>", 
+            parse_mode="HTML"
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "sell")
+def cb_sell(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id, "Выставляю ордер на продажу...")
+    base_coin = TRADING_SYMBOL.replace("USDT", "")
+    
+    try:
+        # Для продажи нужен баланс крипты, а не USDT
+        coin_bal = get_coin_balance(base_coin)
+        logger.info(f"💎 Доступный баланс {base_coin}: {coin_bal}")
+        
+        if coin_bal <= 0:
+            raise ValueError(
+                f"Нет монет {base_coin} для продажи. "
+                f"Сначала купите {base_coin} за USDT."
+            )
+        
+        # Для теста продаём 10% от баланса крипты (или всё, если мало)
+        if coin_bal >= 0.001:
+            sell_amount = round(coin_bal * 0.1, 8)
+        else:
+            sell_amount = coin_bal
+        
+        logger.info(f"💵 Количество для продажи: {sell_amount} {base_coin}")
+        
+        result = place_limit_order(side="Sell", coin_amount=sell_amount)
+        
+        text = (
+            f"✅ <b>Ордер на продажу создан!</b>\n\n"
+            f"🆔 Order ID: <code>{result['orderId']}</code>\n"
+            f"🎯 Пара: {result['symbol']}\n"
+            f"📈 Тип: Limit Sell\n"
+            f"🔢 Количество: <code>{result['qty']}</code> {base_coin}\n"
+            f"💲 Цена ордера: <code>{result['price']}</code> USDT\n"
+            f"📊 Рыночная цена: <code>{result['marketPrice']}</code> USDT\n"
+            f"📏 Отступ от рынка: <code>+{result['offsetPercent']}%</code>\n\n"
+            f"💡 Ордер НЕ исполнится, пока цена не вырастет на {result['offsetPercent']}%\n\n"
+            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        bot.edit_message_text(
+            text, 
+            call.message.chat.id, 
+            call.message.message_id, 
+            parse_mode="HTML"
+        )
+        logger.info(f"✅ Ордер {result['orderId']} создан")
+        
+    except Exception as e:
+        error_text = str(e)
+        logger.exception("Ошибка при создании ордера на продажу")
+        bot.send_message(
+            call.message.chat.id, 
+            f"❌ Ошибка:\n<code>{error_text[:400]}</code>", 
+            parse_mode="HTML"
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "settings")
+def cb_settings(call: types.CallbackQuery):
+    """Показывает текущие настройки бота"""
+    bot.answer_callback_query(call.id, "Загрузка...")
+    
+    text = (
+        "⚙️ <b>Текущие настройки бота</b>\n\n"
+        f"📊 <b>Торговая пара:</b> <code>{TRADING_SYMBOL}</code>\n"
+        f"🏦 <b>Категория:</b> <code>{CATEGORY}</code>\n"
+        f"💰 <b>Мин. сумма ордера:</b> <code>{MIN_ORDER_AMOUNT}</code> USDT\n"
+        f"💵 <b>Желаемая сумма:</b> <code>{TARGET_ORDER_AMOUNT}</code> USDT\n"
+        f"📉 <b>Отступ от рынка:</b> <code>{PRICE_OFFSET_PERCENT}%</code>\n"
+        f"🔑 <b>API Key:</b> <code>{BYBIT_API_KEY[:8]}...{BYBIT_API_KEY[-4:]}</code>\n"
+        f"🔀 <b>Subaccount UID:</b> <code>{BYBIT_SUBACCOUNT_UID or '(не задан)'}</code>\n\n"
+        "💡 <b>Чтобы изменить настройки:</b>\n"
+        "Откройте файл <code>bybit.py</code> и измените значения в разделе\n"
+        "⚙️ <b>НАСТРОЙКИ БОТА (МЕНЯТЬ ЗДЕСЬ)</b> в начале файла."
+    )
+    
+    bot.edit_message_text(
+        text,
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML"
+    )
 
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
-def handle_unknown(message: types.Message) -> None:
-    bot.reply_to(message, "Используйте /start")
+def handle_unknown(message: types.Message):
+    bot.reply_to(message, "Используйте /start для меню")
 
 
+# ============================================================
+# 6. ЗАПУСК БОТА
+# ============================================================
 def main() -> None:
-    logger.info("🎯 Бот готов к работе")
+    logger.info("=" * 60)
+    logger.info("🎯 Бот готов к работе. Ожидание команд...")
+    logger.info("=" * 60)
     
+    # 🔥 Удаляем webhook, если был установлен (решение ошибки 409)
+    try:
+        logger.info("🔌 Проверка и удаление активного вебхука...")
+        bot.delete_webhook()
+        logger.info("✅ Вебхук удален, можно безопасно использовать polling")
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось удалить вебхук: {e}")
+    
+    # Проверяем подключение к Bybit
+    try:
+        logger.info("🔍 Проверка подключения к Bybit API...")
+        market_price, _ = get_market_price(TRADING_SYMBOL)
+        logger.info(f"✅ Подключение к Bybit успешно. {TRADING_SYMBOL} = {market_price}")
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось проверить подключение к Bybit: {e}")
+    
+    # Запуск polling
     while True:
         try:
+            logger.info("🚀 Запуск polling Telegram...")
             bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
         except Exception as e:
             logger.error(f"❌ Ошибка polling: {e}")
+            logger.error(traceback.format_exc())
+            logger.info("⏳ Перезапуск через 5 секунд...")
             time.sleep(5)
 
 
@@ -690,4 +641,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        logger.info("🛑 Остановлен")
+        logger.info("🛑 Бот остановлен пользователем (Ctrl+C)")
+    except Exception as e:
+        logger.critical(f"💥 Критическая ошибка: {e}")
+        logger.critical(traceback.format_exc())
