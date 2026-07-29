@@ -1,5 +1,6 @@
 """
 Telegram бот для проверки способности выставлять ордера на Bybit API (V5)
+Поддерживает Standard Subaccount (Unified и Classic/SPOT)
 """
 import os
 import sys
@@ -38,9 +39,9 @@ BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 BYBIT_SUBACCOUNT_UID = os.getenv("BYBIT_SUBACCOUNT_UID", "").strip()
 
 if not TELEGRAM_BOT_TOKEN:
-    sys.exit("TELEGRAM_BOT_TOKEN не задан")
+    sys.exit("TELEGRAM_BOT_TOKEN не задан в .env")
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    sys.exit("BYBIT_API_KEY или BYBIT_API_SECRET не заданы")
+    sys.exit("BYBIT_API_KEY или BYBIT_API_SECRET не заданы в .env")
 
 # ============================================================
 # ЛОГИРОВАНИЕ
@@ -72,7 +73,7 @@ logger.info(f"Мин. сумма ордера: {MIN_ORDER_AMOUNT} USDT")
 logger.info(f"Желаемая сумма: {TARGET_ORDER_AMOUNT} USDT")
 logger.info(f"Отступ от рынка: {PRICE_OFFSET_PERCENT}%")
 logger.info(f"Bybit API Key: {BYBIT_API_KEY[:8]}...")
-logger.info(f"Subaccount UID: {BYBIT_SUBACCOUNT_UID or '(не задан)'}")
+logger.info(f"Subaccount UID: {BYBIT_SUBACCOUNT_UID or '(не задан, используется основной)'}")
 
 # ============================================================
 # КЛИЕНТ BYBIT V5
@@ -99,7 +100,7 @@ class BybitV5Client:
         recv_window = "5000"
 
         if payload and method.upper() == "POST":
-            query_string = json.dumps(payload)
+            query_string = json.dumps(payload, separators=(',', ':'))
         elif payload and method.upper() == "GET":
             query_string = urlencode(payload)
         else:
@@ -115,8 +116,9 @@ class BybitV5Client:
             "Content-Type": "application/json"
         }
 
+        # Для стандартных субаккаунтов Bybit требует этот заголовок
         if self.subaccount_uid:
-            headers["X-BAPI-SUB-ACCOUNT-UID"] = self.subaccount_uid
+            headers["X-BAPI-SUB-ACCOUNT-UID"] = str(self.subaccount_uid)
 
         url = f"{self.base_url}{endpoint}"
         logger.debug(f"{method} {endpoint}")
@@ -134,7 +136,7 @@ class BybitV5Client:
 
             if result.get("retCode") != 0:
                 error_msg = f"Bybit Error {result.get('retCode')}: {result.get('retMsg')}"
-                logger.error(f"{error_msg}")
+                logger.error(error_msg)
                 raise RuntimeError(error_msg)
             return result
 
@@ -185,32 +187,55 @@ def get_instrument_info(symbol: str = TRADING_SYMBOL, category: str = CATEGORY) 
 
 def get_usdt_balance() -> float:
     logger.info("Запрос баланса USDT")
-    response = bybit.request("GET", "/v5/account/wallet-balance", {
-        "accountType": "UNIFIED",
-        "coin": "USDT"
-    })
-    coin_list = response["result"]["list"][0].get("coin", [])
-    usdt_data = next((c for c in coin_list if c.get("coin") == "USDT"), None)
-    if not usdt_data:
-        raise RuntimeError("USDT не найден в балансе")
-    available = float(usdt_data.get("availableToWithdraw") or usdt_data.get("walletBalance", 0))
-    logger.info(f"Доступный баланс USDT: {available}")
-    return available
+    # Пробуем UNIFIED, если не получается - SPOT (для классических стандартных субаккаунтов)
+    for acc_type in ["UNIFIED", "SPOT"]:
+        try:
+            response = bybit.request("GET", "/v5/account/wallet-balance", {
+                "accountType": acc_type,
+                "coin": "USDT"
+            })
+            list_data = response["result"].get("list", [])
+            if not list_data:
+                continue
+            
+            coin_list = list_data[0].get("coin", [])
+            usdt_data = next((c for c in coin_list if c.get("coin") == "USDT"), None)
+            
+            if usdt_data:
+                available = float(usdt_data.get("availableToWithdraw") or usdt_data.get("walletBalance", 0))
+                logger.info(f"Доступный баланс USDT ({acc_type}): {available}")
+                return available
+        except Exception as e:
+            logger.warning(f"Не удалось получить баланс для {acc_type}: {e}")
+            continue
+            
+    raise RuntimeError("USDT не найден в балансе (проверены UNIFIED и SPOT)")
 
 
 def get_coin_balance(coin: str) -> float:
     logger.info(f"Запрос баланса {coin}")
-    response = bybit.request("GET", "/v5/account/wallet-balance", {
-        "accountType": "UNIFIED",
-        "coin": coin
-    })
-    coin_list = response["result"]["list"][0].get("coin", [])
-    coin_data = next((c for c in coin_list if c.get("coin") == coin), None)
-    if not coin_data:
-        return 0.0
-    available = float(coin_data.get("availableToWithdraw") or coin_data.get("walletBalance", 0))
-    logger.info(f"Доступный баланс {coin}: {available}")
-    return available
+    for acc_type in ["UNIFIED", "SPOT"]:
+        try:
+            response = bybit.request("GET", "/v5/account/wallet-balance", {
+                "accountType": acc_type,
+                "coin": coin
+            })
+            list_data = response["result"].get("list", [])
+            if not list_data:
+                continue
+            
+            coin_list = list_data[0].get("coin", [])
+            coin_data = next((c for c in coin_list if c.get("coin") == coin), None)
+            
+            if coin_data:
+                available = float(coin_data.get("availableToWithdraw") or coin_data.get("walletBalance", 0))
+                logger.info(f"Доступный баланс {coin} ({acc_type}): {available}")
+                return available
+        except Exception as e:
+            logger.warning(f"Не удалось получить баланс для {acc_type}: {e}")
+            continue
+            
+    return 0.0
 
 
 def place_limit_order(side: str, usdt_amount: Optional[float] = None, coin_amount: Optional[float] = None) -> dict:
@@ -323,7 +348,7 @@ def cmd_start(message: types.Message):
 @bot.callback_query_handler(func=lambda call: call.data == "balance_usdt")
 def cb_balance_usdt(call: types.CallbackQuery):
     bot.answer_callback_query(call.id, "Загрузка...")
-    logger.info(f"Нажата кнопка: balance_usdt от {call.from_user.id}")
+    logger.info(f"НАЖАТА КНОПКА: balance_usdt пользователем {call.from_user.id}")
     try:
         bal = get_usdt_balance()
         bot.edit_message_text(
@@ -336,14 +361,14 @@ def cb_balance_usdt(call: types.CallbackQuery):
         )
     except Exception as e:
         logger.exception("Ошибка при получении баланса USDT")
-        bot.send_message(call.message.chat.id, f"Ошибка: {e}")
+        bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "balance_coin")
 def cb_balance_coin(call: types.CallbackQuery):
     bot.answer_callback_query(call.id, "Загрузка...")
     base_coin = TRADING_SYMBOL.replace("USDT", "")
-    logger.info(f"Нажата кнопка: balance_coin от {call.from_user.id}")
+    logger.info(f"НАЖАТА КНОПКА: balance_coin пользователем {call.from_user.id}")
     try:
         bal = get_coin_balance(base_coin)
         bot.edit_message_text(
@@ -356,14 +381,14 @@ def cb_balance_coin(call: types.CallbackQuery):
         )
     except Exception as e:
         logger.exception("Ошибка при получении баланса монеты")
-        bot.send_message(call.message.chat.id, f"Ошибка: {e}")
+        bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "buy")
 def cb_buy(call: types.CallbackQuery):
     bot.answer_callback_query(call.id, "Выставляю ордер на покупку...")
     base_coin = TRADING_SYMBOL.replace("USDT", "")
-    logger.info(f"Нажата кнопка: buy от {call.from_user.id}")
+    logger.info(f"НАЖАТА КНОПКА: buy пользователем {call.from_user.id}")
     try:
         bal = get_usdt_balance()
         logger.info(f"Доступный баланс: {bal} USDT")
@@ -406,7 +431,7 @@ def cb_buy(call: types.CallbackQuery):
 def cb_sell(call: types.CallbackQuery):
     bot.answer_callback_query(call.id, "Выставляю ордер на продажу...")
     base_coin = TRADING_SYMBOL.replace("USDT", "")
-    logger.info(f"Нажата кнопка: sell от {call.from_user.id}")
+    logger.info(f"НАЖАТА КНОПКА: sell пользователем {call.from_user.id}")
     try:
         coin_bal = get_coin_balance(base_coin)
         logger.info(f"Доступный баланс {base_coin}: {coin_bal}")
@@ -445,7 +470,7 @@ def cb_sell(call: types.CallbackQuery):
 @bot.callback_query_handler(func=lambda call: call.data == "settings")
 def cb_settings(call: types.CallbackQuery):
     bot.answer_callback_query(call.id, "Загрузка...")
-    logger.info(f"Нажата кнопка: settings от {call.from_user.id}")
+    logger.info(f"НАЖАТА КНОПКА: settings пользователем {call.from_user.id}")
     text = (
         f"<b>Текущие настройки бота</b>\n\n"
         f"Торговая пара: <code>{TRADING_SYMBOL}</code>\n"
